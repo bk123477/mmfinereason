@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MMFineReason Viewer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1117; color: #e1e4e8; }
+    body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+    /* ── Top bar ── */
+    #topbar {
+      flex-shrink: 0;
+      display: flex; align-items: center; gap: 10px;
+      background: #161b22; border-bottom: 1px solid #30363d;
+      padding: 9px 20px; flex-wrap: wrap;
+    }
+    #topbar h1 { font-size: 1rem; font-weight: 700; color: #58a6ff; white-space: nowrap; }
+
+    .select-group { display: flex; align-items: center; gap: 6px; }
+    .select-label { font-size: 0.72rem; color: #6e7681; white-space: nowrap; }
+
+    /* Run selectors */
+    .run-select {
+      max-width: 210px;
+      background: #161b22; color: #f0883e;
+      border: 1px solid #f0883e55; border-radius: 6px;
+      padding: 4px 8px; font-size: 0.8rem; cursor: pointer;
+    }
+    .run-select.run-b { color: #bc8cff; border-color: #bc8cff55; }
+
+    /* Subset selector */
+    #subsetSelect {
+      max-width: 300px;
+      background: #21262d; color: #e1e4e8;
+      border: 1px solid #30363d; border-radius: 6px;
+      padding: 4px 8px; font-size: 0.82rem; cursor: pointer;
+    }
+
+    /* Compare toggle button */
+    #btnCompare {
+      background: #21262d; color: #8b949e;
+      border: 1px solid #30363d; border-radius: 6px;
+      padding: 5px 12px; font-size: 0.82rem; cursor: pointer;
+      white-space: nowrap; transition: all .15s;
+    }
+    #btnCompare.active { background: #1f2d1f; color: #3fb950; border-color: #3fb95055; }
+
+    /* Pagination */
+    .pag { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+    .pag-label { font-size: 0.72rem; color: #6e7681; }
+    .pag button {
+      background: #21262d; color: #e1e4e8;
+      border: 1px solid #30363d; border-radius: 6px;
+      padding: 4px 12px; font-size: 0.82rem; cursor: pointer; transition: background .15s;
+    }
+    .pag button:hover:not(:disabled) { background: #30363d; }
+    .pag button:disabled { opacity: .35; cursor: default; }
+    #sampleInfo { font-size: 0.82rem; color: #8b949e; min-width: 52px; text-align: center; }
+
+    /* ── Guide bar ── */
+    #guidebar {
+      flex-shrink: 0;
+      display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      background: #0d1117; border-bottom: 1px solid #21262d;
+      padding: 5px 20px; font-size: 0.7rem; color: #6e7681;
+    }
+    #guidebar .g-title { color: #484f58; font-weight: 600; margin-right: 4px; }
+    .kbd {
+      display: inline-flex; align-items: center; justify-content: center;
+      background: #21262d; border: 1px solid #30363d; border-bottom-width: 2px;
+      border-radius: 4px; padding: 1px 6px; font-size: 0.68rem;
+      color: #c9d1d9; font-family: monospace; line-height: 1.4;
+    }
+    .g-sep { color: #30363d; margin: 0 4px; }
+
+    /* ── Question / image panel ── */
+    #qpanel {
+      flex-shrink: 0;
+      display: flex; gap: 16px; align-items: flex-start;
+      background: #161b22; border-bottom: 1px solid #30363d;
+      padding: 12px 20px; max-height: 36vh; overflow: hidden;
+    }
+    #qpanel img {
+      max-height: 28vh; max-width: 280px;
+      border-radius: 8px; border: 1px solid #30363d;
+      object-fit: contain; flex-shrink: 0;
+    }
+    #noImage {
+      width: 110px; height: 80px; border-radius: 8px;
+      border: 1px dashed #30363d; display: flex; align-items: center;
+      justify-content: center; color: #484f58; font-size: 0.7rem; flex-shrink: 0;
+    }
+    #qtext { flex: 1; overflow-y: auto; max-height: 28vh; }
+    .qlabel { font-size: 0.68rem; font-weight: 600; color: #58a6ff; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 5px; }
+    .subset-badge {
+      display: inline-block; background: #1f6feb22; border: 1px solid #1f6feb66;
+      color: #58a6ff; border-radius: 4px; font-size: 0.7rem; padding: 1px 6px; margin-bottom: 6px;
+    }
+    #questionText { font-size: 0.88rem; line-height: 1.55; white-space: pre-wrap; }
+    #optionsBox { margin-top: 6px; font-size: 0.82rem; color: #8b949e; white-space: pre-wrap; }
+
+    /* Ground truth answer badge in question panel */
+    #answerBadge {
+      display: none; margin-top: 8px;
+      font-size: 0.82rem; font-weight: 700;
+    }
+    #answerBadge .ans-label { color: #6e7681; }
+    #answerBadge .ans-value { color: #3fb950; margin-left: 4px; }
+
+    /* ── Two-column area ── */
+    #columns {
+      flex: 1; display: grid; grid-template-columns: 1fr 1fr;
+      overflow: hidden; min-height: 0;
+    }
+    .col {
+      display: flex; flex-direction: column;
+      border-right: 1px solid #30363d; overflow: hidden; min-height: 0;
+    }
+    .col:last-child { border-right: none; }
+    .col-header {
+      flex-shrink: 0; background: #161b22; border-bottom: 1px solid #30363d;
+      padding: 7px 16px; font-size: 0.75rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: .07em; color: #8b949e;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .dot-green  { background: #3fb950; }
+    .dot-blue   { background: #58a6ff; }
+    .dot-orange { background: #f0883e; }
+    .dot-purple { background: #bc8cff; }
+
+    .col-body { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
+    .sub-panel { display: flex; flex-direction: column; overflow: hidden; min-height: 0; border-bottom: 1px solid #21262d; }
+    .sub-panel:last-child { border-bottom: none; }
+    .sub-panel.main  { flex: 3; }
+    .sub-panel.minor { flex: 1; }
+
+    .sub-label {
+      flex-shrink: 0; background: #0d1117; padding: 4px 16px;
+      font-size: 0.68rem; font-weight: 600; color: #6e7681;
+      text-transform: uppercase; letter-spacing: .06em;
+      border-bottom: 1px solid #21262d;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .char-count { color: #484f58; font-size: 0.66rem; }
+    .sub-content {
+      flex: 1; overflow-y: auto;
+      padding: 10px 16px; font-size: 0.82rem; line-height: 1.6;
+      white-space: pre-wrap; word-break: break-word; color: #c9d1d9;
+    }
+    .answer-content { color: #3fb950; font-size: 1rem; font-weight: 700; }
+
+    /* scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #484f58; }
+
+    /* ── Stats button ── */
+    #btnStats {
+      background: #21262d; color: #8b949e;
+      border: 1px solid #30363d; border-radius: 6px;
+      padding: 5px 12px; font-size: 0.82rem; cursor: pointer;
+      white-space: nowrap; transition: all .15s;
+    }
+    #btnStats:hover { background: #30363d; color: #e1e4e8; }
+
+    /* ── Stats modal ── */
+    #statsOverlay {
+      display: none; position: fixed; inset: 0; z-index: 100;
+      background: rgba(0,0,0,.65); backdrop-filter: blur(4px);
+      align-items: center; justify-content: center;
+    }
+    #statsOverlay.open { display: flex; }
+    #statsModal {
+      background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+      width: min(92vw, 900px); max-height: 80vh;
+      display: flex; flex-direction: column; overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0,0,0,.6);
+    }
+    #statsHeader {
+      flex-shrink: 0; display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 20px; border-bottom: 1px solid #30363d;
+    }
+    #statsHeader h2 { font-size: 0.95rem; font-weight: 700; color: #58a6ff; }
+    #statsRunLabel { font-size: 0.78rem; color: #6e7681; margin-left: 10px; }
+    #statsClose {
+      background: none; border: none; color: #6e7681; font-size: 1.2rem;
+      cursor: pointer; padding: 2px 6px; border-radius: 4px; line-height: 1;
+    }
+    #statsClose:hover { color: #e1e4e8; background: #21262d; }
+    #statsBody { flex: 1; overflow-y: auto; padding: 16px 20px; }
+
+    .stats-table {
+      width: 100%; border-collapse: collapse; font-size: 0.82rem;
+    }
+    .stats-table th {
+      background: #0d1117; color: #6e7681; font-weight: 600;
+      text-align: left; padding: 7px 10px; border-bottom: 1px solid #30363d;
+      white-space: nowrap; font-size: 0.75rem; text-transform: uppercase; letter-spacing: .05em;
+    }
+    .stats-table th.num { text-align: right; }
+    .stats-table td { padding: 6px 10px; border-bottom: 1px solid #21262d; color: #c9d1d9; }
+    .stats-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .stats-table tr:hover td { background: #1c2128; }
+    .stats-table tr.total-row td {
+      background: #1f2d1f; color: #3fb950; font-weight: 700;
+      border-top: 2px solid #3fb95044; border-bottom: none;
+    }
+    .stats-table tr.total-row td.num { color: #3fb950; }
+    .bar-wrap { display: flex; align-items: center; gap: 8px; }
+    .bar { height: 6px; border-radius: 3px; min-width: 2px; flex-shrink: 0; }
+    .bar-r { background: #58a6ff; }
+    .bar-p { background: #f0883e; }
+    .num-val { font-variant-numeric: tabular-nums; }
+    .stats-legend {
+      display: flex; gap: 16px; font-size: 0.72rem; color: #6e7681;
+      margin-bottom: 12px; flex-wrap: wrap;
+    }
+    .stats-legend span { display: flex; align-items: center; gap: 5px; }
+    .legend-dot { width: 9px; height: 9px; border-radius: 2px; flex-shrink: 0; }
+  </style>
+</head>
+<body>
+
+<!-- ── Top bar ── -->
+<div id="topbar">
+  <h1>🔍 MMFineReason Viewer</h1>
+
+  <!-- Stats button -->
+  <button id="btnStats">📊 Stats</button>
+
+  <!-- Compare toggle -->
+  <button id="btnCompare">⇄ Compare</button>
+
+  <!-- Normal mode: single Run -->
+  <div id="normalControls" class="select-group">
+    <span class="select-label">Run</span>
+    <select id="runSelect" class="run-select">
+      {% for r in runs %}
+      <option value="{{ r }}">{{ r }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <!-- Compare mode: Run A + Run B -->
+  <div id="compareControls" style="display:none; display:none; gap:8px;" class="select-group">
+    <span class="select-label" style="color:#f0883e;">A</span>
+    <select id="runSelectA" class="run-select">
+      {% for r in runs %}
+      <option value="{{ r }}">{{ r }}</option>
+      {% endfor %}
+    </select>
+    <span class="select-label" style="color:#bc8cff; margin-left:4px;">B</span>
+    <select id="runSelectB" class="run-select run-b">
+      {% for r in runs %}
+      <option value="{{ r }}">{{ r }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <!-- Subset -->
+  <div class="select-group">
+    <span class="select-label">Subset</span>
+    <select id="subsetSelect"></select>
+  </div>
+
+  <!-- Pagination -->
+  <div class="pag">
+    <span class="pag-label">Sample</span>
+    <button id="btnPrev">◀</button>
+    <span id="sampleInfo">— / —</span>
+    <button id="btnNext">▶</button>
+  </div>
+</div>
+
+<!-- ── Guide bar ── -->
+<div id="guidebar">
+  <span class="g-title">⌨ 단축키</span>
+  <span class="kbd">←</span><span class="kbd">→</span> 샘플 이동
+  <span class="g-sep">|</span>
+  <span class="kbd">↑</span><span class="kbd">↓</span> Subset 이동
+  <span class="g-sep">|</span>
+  <span class="kbd">Run Dropdown</span> 실험 버전 선택
+  <span class="g-sep">|</span>
+  <span class="kbd">⇄ Compare</span> 두 버전 비교 모드
+  <span class="g-sep">|</span>
+  각 영역 <strong style="color:#c9d1d9">독립 스크롤</strong>
+</div>
+
+<!-- ── Question / Image panel ── -->
+<div id="qpanel">
+  <div id="noImage">No image</div>
+  <img id="qimage" src="" alt="sample image" style="display:none;" />
+  <div id="qtext">
+    <div class="qlabel">Question</div>
+    <span id="subsetBadge" class="subset-badge"></span>
+    <div id="questionText">Loading...</div>
+    <div id="optionsBox"></div>
+    <!-- Answer badge: shown in compare mode -->
+    <div id="answerBadge">
+      <span class="ans-label">Ground Truth Answer:</span>
+      <span class="ans-value" id="answerValue">—</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── Two columns ── -->
+<div id="columns">
+
+  <!-- LEFT column -->
+  <div class="col">
+    <div class="col-header" id="leftHeader">
+      <span class="dot dot-green"></span>
+      <span id="leftTitle">Reference · Qwen3-VL-235B-Thinking</span>
+    </div>
+    <div class="col-body" id="leftBody">
+      <!-- Normal mode: qwen thinking + answer -->
+      <div id="leftNormal" style="display:contents;">
+        <div class="sub-panel main">
+          <div class="sub-label">
+            <span>qwen3vl_235b_thinking_response</span>
+            <span class="char-count" id="refThinkCount"></span>
+          </div>
+          <div class="sub-content" id="refThinking">—</div>
+        </div>
+        <div class="sub-panel minor">
+          <div class="sub-label"><span>answer (ground truth)</span></div>
+          <div class="sub-content answer-content" id="refAnswer">—</div>
+        </div>
+      </div>
+      <!-- Compare mode: Run A reasoning + response -->
+      <div id="leftCompare" style="display:none; height:100%; display:none; flex-direction:column;">
+        <div class="sub-panel main">
+          <div class="sub-label">
+            <span>reasoning</span>
+            <span class="char-count" id="cmpAReasonCount"></span>
+          </div>
+          <div class="sub-content" id="cmpAReasoning">—</div>
+        </div>
+        <div class="sub-panel minor">
+          <div class="sub-label">
+            <span>response</span>
+            <span class="char-count" id="cmpARespCount"></span>
+          </div>
+          <div class="sub-content" id="cmpAResponse">—</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT column -->
+  <div class="col">
+    <div class="col-header" id="rightHeader">
+      <span class="dot dot-blue"></span>
+      <span id="rightTitle">Model Output · OpenRouter</span>
+    </div>
+    <div class="col-body" id="rightBody">
+      <!-- Normal mode: reasoning + response -->
+      <div id="rightNormal" style="display:contents;">
+        <div class="sub-panel main">
+          <div class="sub-label">
+            <span>reasoning (chain-of-thought)</span>
+            <span class="char-count" id="ourReasonCount"></span>
+          </div>
+          <div class="sub-content" id="ourReasoning">—</div>
+        </div>
+        <div class="sub-panel minor">
+          <div class="sub-label">
+            <span>response</span>
+            <span class="char-count" id="ourRespCount"></span>
+          </div>
+          <div class="sub-content" id="ourResponse">—</div>
+        </div>
+      </div>
+      <!-- Compare mode: Run B reasoning + response -->
+      <div id="rightCompare" style="display:none; height:100%; display:none; flex-direction:column;">
+        <div class="sub-panel main">
+          <div class="sub-label">
+            <span>reasoning</span>
+            <span class="char-count" id="cmpBReasonCount"></span>
+          </div>
+          <div class="sub-content" id="cmpBReasoning">—</div>
+        </div>
+        <div class="sub-panel minor">
+          <div class="sub-label">
+            <span>response</span>
+            <span class="char-count" id="cmpBRespCount"></span>
+          </div>
+          <div class="sub-content" id="cmpBResponse">—</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- #columns -->
+
+<!-- ── Stats Modal ── -->
+<div id="statsOverlay">
+  <div id="statsModal">
+    <div id="statsHeader">
+      <div style="display:flex;align-items:baseline;gap:0;">
+        <h2>📊 Statistics</h2>
+        <span id="statsRunLabel"></span>
+      </div>
+      <button id="statsClose">✕</button>
+    </div>
+    <div id="statsBody">
+      <div id="statsContent">Loading…</div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ── State ──────────────────────────────────────────────
+  let compareMode = false;
+  let curRun    = '';
+  let SUBSETS   = [];
+  let curSubset = 0;
+  let curSample = 0;
+
+  // ── DOM refs ───────────────────────────────────────────
+  const btnCompare      = document.getElementById('btnCompare');
+  const normalControls  = document.getElementById('normalControls');
+  const compareControls = document.getElementById('compareControls');
+  const runSelect       = document.getElementById('runSelect');
+  const runSelectA      = document.getElementById('runSelectA');
+  const runSelectB      = document.getElementById('runSelectB');
+  const subsetSelect    = document.getElementById('subsetSelect');
+  const btnPrev         = document.getElementById('btnPrev');
+  const btnNext         = document.getElementById('btnNext');
+  const sampleInfo      = document.getElementById('sampleInfo');
+  const qimage          = document.getElementById('qimage');
+  const noImage         = document.getElementById('noImage');
+  const subsetBadge     = document.getElementById('subsetBadge');
+  const questionText    = document.getElementById('questionText');
+  const optionsBox      = document.getElementById('optionsBox');
+  const answerBadge     = document.getElementById('answerBadge');
+  const answerValue     = document.getElementById('answerValue');
+
+  // Normal mode
+  const leftNormal    = document.getElementById('leftNormal');
+  const rightNormal   = document.getElementById('rightNormal');
+  const refThinking   = document.getElementById('refThinking');
+  const refAnswer     = document.getElementById('refAnswer');
+  const refThinkCount = document.getElementById('refThinkCount');
+  const ourReasoning  = document.getElementById('ourReasoning');
+  const ourResponse   = document.getElementById('ourResponse');
+  const ourReasonCount= document.getElementById('ourReasonCount');
+  const ourRespCount  = document.getElementById('ourRespCount');
+
+  // Compare mode
+  const leftCompare    = document.getElementById('leftCompare');
+  const rightCompare   = document.getElementById('rightCompare');
+  const leftTitle      = document.getElementById('leftTitle');
+  const rightTitle     = document.getElementById('rightTitle');
+  const cmpAReasoning  = document.getElementById('cmpAReasoning');
+  const cmpAResponse   = document.getElementById('cmpAResponse');
+  const cmpAReasonCount= document.getElementById('cmpAReasonCount');
+  const cmpARespCount  = document.getElementById('cmpARespCount');
+  const cmpBReasoning  = document.getElementById('cmpBReasoning');
+  const cmpBResponse   = document.getElementById('cmpBResponse');
+  const cmpBReasonCount= document.getElementById('cmpBReasonCount');
+  const cmpBRespCount  = document.getElementById('cmpBRespCount');
+
+  // ── Helpers ─────────────────────────────────────────────
+  function charCount(t) {
+    if (!t) return '';
+    return t.length >= 1000 ? `${(t.length/1000).toFixed(1)}k chars` : `${t.length} chars`;
+  }
+
+  function updatePagination() {
+    const total = SUBSETS[curSubset] ? SUBSETS[curSubset].count : 0;
+    sampleInfo.textContent = total ? `${curSample + 1} / ${total}` : '— / —';
+    btnPrev.disabled = curSample === 0;
+    btnNext.disabled = !total || curSample === total - 1;
+  }
+
+  function rebuildSubsetDropdown() {
+    subsetSelect.innerHTML = '';
+    SUBSETS.forEach((s, i) => {
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.textContent = `${i+1}. ${s.name} (${s.count} sample${s.count!==1?'s':''})`;
+      subsetSelect.appendChild(opt);
+    });
+  }
+
+  function applyImage(data) {
+    if (data && data.image_rel) {
+      qimage.src = `/images/${data.image_rel}`;
+      qimage.style.display = 'block';
+      noImage.style.display = 'none';
+    } else {
+      qimage.style.display = 'none';
+      noImage.style.display = 'flex';
+    }
+  }
+
+  function applyQuestion(data, subsetName) {
+    subsetBadge.textContent  = subsetName || '';
+    questionText.textContent = data ? (data.question || '(no question)') : '—';
+    if (data && data.options && data.options.length > 0) {
+      const L = 'ABCDEFGHIJ'.split('');
+      optionsBox.textContent = data.options.map((o,i)=>`(${L[i]||i}) ${o}`).join('\n');
+    } else {
+      optionsBox.textContent = '';
+    }
+  }
+
+  // ── Toggle compare mode ─────────────────────────────────
+  function setCompareMode(on) {
+    compareMode = on;
+    btnCompare.classList.toggle('active', on);
+
+    normalControls.style.display  = on ? 'none' : 'flex';
+    compareControls.style.display = on ? 'flex'  : 'none';
+
+    // Column visibility
+    leftNormal.style.display   = on ? 'none'  : 'contents';
+    rightNormal.style.display  = on ? 'none'  : 'contents';
+    leftCompare.style.display  = on ? 'flex'  : 'none';
+    rightCompare.style.display = on ? 'flex'  : 'none';
+
+    // Answer badge in question panel
+    answerBadge.style.display = on ? 'block' : 'none';
+
+    if (on) {
+      leftTitle.textContent  = `Run A · ${runSelectA.value}`;
+      rightTitle.textContent = `Run B · ${runSelectB.value}`;
+      document.querySelector('#leftHeader .dot').className  = 'dot dot-orange';
+      document.querySelector('#rightHeader .dot').className = 'dot dot-purple';
+    } else {
+      leftTitle.textContent  = 'Reference · Qwen3-VL-235B-Thinking';
+      rightTitle.textContent = 'Model Output · OpenRouter';
+      document.querySelector('#leftHeader .dot').className  = 'dot dot-green';
+      document.querySelector('#rightHeader .dot').className = 'dot dot-blue';
+    }
+  }
+
+  // ── Load run (normal mode) ──────────────────────────────
+  async function loadRun(runName) {
+    curRun = runName; curSubset = 0; curSample = 0;
+    const resp = await fetch(`/api/run/${encodeURIComponent(runName)}/subsets`);
+    SUBSETS = await resp.json();
+    rebuildSubsetDropdown();
+    updatePagination();
+    if (SUBSETS.length > 0) await loadSample(0, 0);
+  }
+
+  // ── Load sample (normal mode) ───────────────────────────
+  async function loadSample(sIdx, eIdx) {
+    curSubset = sIdx; curSample = eIdx;
+    subsetSelect.value = sIdx;
+    updatePagination();
+    questionText.textContent = 'Loading…';
+
+    const data = await fetchEntry(curRun, sIdx, eIdx);
+    if (!data) return;
+
+    applyImage(data);
+    applyQuestion(data, SUBSETS[sIdx]?.name);
+
+    // Normal left column
+    const qt = data.qwen_thinking || '(empty)';
+    refThinking.textContent   = qt;
+    refThinkCount.textContent = charCount(qt);
+    refAnswer.textContent     = data.answer || '(no answer)';
+
+    // Normal right column
+    const rc = data.reasoning || '(empty)';
+    const rs = data.response  || '(empty)';
+    ourReasoning.textContent   = rc;
+    ourReasonCount.textContent = charCount(rc);
+    ourResponse.textContent    = rs;
+    ourRespCount.textContent   = charCount(rs);
+
+    scrollTop();
+  }
+
+  // ── Load compare sample ─────────────────────────────────
+  async function loadCompareSample(sIdx, eIdx) {
+    curSubset = sIdx; curSample = eIdx;
+    subsetSelect.value = sIdx;
+    updatePagination();
+    questionText.textContent = 'Loading…';
+
+    const runA = runSelectA.value;
+    const runB = runSelectB.value;
+
+    const [dataA, dataB] = await Promise.all([
+      fetchEntry(runA, sIdx, eIdx),
+      fetchEntry(runB, sIdx, eIdx),
+    ]);
+
+    const data = dataA || dataB;
+    if (!data) return;
+
+    applyImage(data);
+    applyQuestion(data, SUBSETS[sIdx]?.name);
+    answerValue.textContent = data.answer || '(no answer field)';
+
+    // Left: Run A
+    const raR = (dataA?.reasoning) || '(empty)';
+    const raP = (dataA?.response)  || '(empty)';
+    cmpAReasoning.textContent   = raR;
+    cmpAReasonCount.textContent = charCount(raR);
+    cmpAResponse.textContent    = raP;
+    cmpARespCount.textContent   = charCount(raP);
+
+    // Right: Run B
+    const rbR = (dataB?.reasoning) || '(empty)';
+    const rbP = (dataB?.response)  || '(empty)';
+    cmpBReasoning.textContent   = rbR;
+    cmpBReasonCount.textContent = charCount(rbR);
+    cmpBResponse.textContent    = rbP;
+    cmpBRespCount.textContent   = charCount(rbP);
+
+    leftTitle.textContent  = `Run A · ${runA}`;
+    rightTitle.textContent = `Run B · ${runB}`;
+
+    scrollTop();
+  }
+
+  async function fetchEntry(run, sIdx, eIdx) {
+    try {
+      const r = await fetch(`/api/run/${encodeURIComponent(run)}/subset/${sIdx}/sample/${eIdx}`);
+      if (!r.ok) return null;
+      return await r.json();
+    } catch { return null; }
+  }
+
+  function scrollTop() {
+    [refThinking, refAnswer, ourReasoning, ourResponse,
+     cmpAReasoning, cmpAResponse, cmpBReasoning, cmpBResponse]
+      .forEach(el => el.scrollTop = 0);
+  }
+
+  // Unified load dispatcher
+  function doLoad(sIdx, eIdx) {
+    if (compareMode) loadCompareSample(sIdx, eIdx);
+    else             loadSample(sIdx, eIdx);
+  }
+
+  // ── Event listeners ────────────────────────────────────
+  btnCompare.addEventListener('click', async () => {
+    const next = !compareMode;
+    setCompareMode(next);
+    if (next) {
+      // Compare mode: load subsets from Run A (reference)
+      const resp = await fetch(`/api/run/${encodeURIComponent(runSelectA.value)}/subsets`);
+      SUBSETS = await resp.json();
+      rebuildSubsetDropdown();
+      updatePagination();
+      curSubset = 0; curSample = 0;
+      if (SUBSETS.length) loadCompareSample(0, 0);
+    } else {
+      loadRun(runSelect.value);
+    }
+  });
+
+  runSelect.addEventListener('change',  e => loadRun(e.target.value));
+  runSelectA.addEventListener('change', async e => {
+    // Refresh subset list from new Run A
+    const resp = await fetch(`/api/run/${encodeURIComponent(e.target.value)}/subsets`);
+    SUBSETS = await resp.json();
+    rebuildSubsetDropdown();
+    curSubset = 0; curSample = 0;
+    updatePagination();
+    if (SUBSETS.length) loadCompareSample(0, 0);
+  });
+  runSelectB.addEventListener('change', () => {
+    if (SUBSETS.length) loadCompareSample(curSubset, curSample);
+  });
+
+  subsetSelect.addEventListener('change', e => doLoad(parseInt(e.target.value, 10), 0));
+
+  btnPrev.addEventListener('click', () => {
+    if (curSample > 0) doLoad(curSubset, curSample - 1);
+  });
+  btnNext.addEventListener('click', () => {
+    if (SUBSETS[curSubset] && curSample < SUBSETS[curSubset].count - 1)
+      doLoad(curSubset, curSample + 1);
+  });
+
+  document.addEventListener('keydown', e => {
+    if ([subsetSelect, runSelect, runSelectA, runSelectB].includes(document.activeElement)) return;
+    switch (e.key) {
+      case 'ArrowLeft':
+        if (curSample > 0) doLoad(curSubset, curSample - 1);
+        e.preventDefault(); break;
+      case 'ArrowRight':
+        if (SUBSETS[curSubset] && curSample < SUBSETS[curSubset].count - 1)
+          doLoad(curSubset, curSample + 1);
+        e.preventDefault(); break;
+      case 'ArrowUp':
+        if (curSubset > 0) doLoad(curSubset - 1, 0);
+        e.preventDefault(); break;
+      case 'ArrowDown':
+        if (curSubset < SUBSETS.length - 1) doLoad(curSubset + 1, 0);
+        e.preventDefault(); break;
+    }
+  });
+
+  // ── Init ───────────────────────────────────────────────
+  if (runSelect.options.length > 0) {
+    // Pre-select Run B as second option if available
+    if (runSelectB.options.length > 1) runSelectB.selectedIndex = 1;
+    loadRun(runSelect.options[0].value);
+  } else {
+    questionText.textContent = 'No runs found. Generate reasoning first.';
+  }
+
+  // ── Stats Modal ────────────────────────────────────────
+  const btnStats     = document.getElementById('btnStats');
+  const statsOverlay = document.getElementById('statsOverlay');
+  const statsClose   = document.getElementById('statsClose');
+  const statsRunLabel= document.getElementById('statsRunLabel');
+  const statsContent = document.getElementById('statsContent');
+
+  function fmtNum(n) {
+    if (n == null) return '—';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+    return String(n);
+  }
+
+  function renderStats(data) {
+    const rows   = data.subsets;
+    const total  = data.total;
+    statsRunLabel.textContent = ` · ${data.run}`;
+
+    // Find max for bar scaling
+    const allAvgR = rows.map(r => r.avg_reasoning || 0);
+    const allAvgP = rows.map(r => r.avg_response  || 0);
+    const maxR = Math.max(...allAvgR, 1);
+    const maxP = Math.max(...allAvgP, 1);
+    const BAR_MAX = 80; // px
+
+    let html = `
+      <div class="stats-legend">
+        <span><span class="legend-dot" style="background:#58a6ff"></span>reasoning (avg chars)</span>
+        <span><span class="legend-dot" style="background:#f0883e"></span>response (avg chars)</span>
+      </div>
+      <table class="stats-table">
+        <thead>
+          <tr>
+            <th>Subset</th>
+            <th class="num">Samples</th>
+            <th>Avg Reasoning</th>
+            <th class="num">Min</th>
+            <th class="num">Max</th>
+            <th>Avg Response</th>
+            <th class="num">Min</th>
+            <th class="num">Max</th>
+          </tr>
+        </thead>
+        <tbody>`;
+
+    rows.forEach(r => {
+      const barRW = r.avg_reasoning ? Math.max(2, Math.round((r.avg_reasoning / maxR) * BAR_MAX)) : 0;
+      const barPW = r.avg_response  ? Math.max(2, Math.round((r.avg_response  / maxP) * BAR_MAX)) : 0;
+      html += `
+        <tr>
+          <td>${r.subset}</td>
+          <td class="num">${r.count}</td>
+          <td>
+            <div class="bar-wrap">
+              <div class="bar bar-r" style="width:${barRW}px"></div>
+              <span class="num-val">${fmtNum(r.avg_reasoning)}</span>
+            </div>
+          </td>
+          <td class="num">${fmtNum(r.min_reasoning)}</td>
+          <td class="num">${fmtNum(r.max_reasoning)}</td>
+          <td>
+            <div class="bar-wrap">
+              <div class="bar bar-p" style="width:${barPW}px"></div>
+              <span class="num-val">${fmtNum(r.avg_response)}</span>
+            </div>
+          </td>
+          <td class="num">${fmtNum(r.min_response)}</td>
+          <td class="num">${fmtNum(r.max_response)}</td>
+        </tr>`;
+    });
+
+    // Total row
+    html += `
+        <tr class="total-row">
+          <td>TOTAL</td>
+          <td class="num">${total.count}</td>
+          <td colspan="3"><span class="num-val">${fmtNum(total.avg_reasoning)} avg</span></td>
+          <td colspan="3"><span class="num-val">${fmtNum(total.avg_response)} avg</span></td>
+        </tr>
+        </tbody></table>`;
+
+    statsContent.innerHTML = html;
+  }
+
+  async function openStats() {
+    const runName = compareMode ? runSelectA.value : runSelect.value;
+    statsContent.innerHTML = 'Loading…';
+    statsOverlay.classList.add('open');
+    try {
+      const resp = await fetch(`/api/run/${encodeURIComponent(runName)}/stats`);
+      const data = await resp.json();
+      renderStats(data);
+    } catch(e) {
+      statsContent.innerHTML = `<span style="color:#f85149">Error: ${e.message}</span>`;
+    }
+  }
+
+  btnStats.addEventListener('click', openStats);
+  statsClose.addEventListener('click', () => statsOverlay.classList.remove('open'));
+  statsOverlay.addEventListener('click', e => {
+    if (e.target === statsOverlay) statsOverlay.classList.remove('open');
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') statsOverlay.classList.remove('open');
+  });
+</script>
+</body>
+</html>
