@@ -1,27 +1,3 @@
 {
-  "BMMR": 10,
-  "Euclid30K": 10,
-  "FineVision-ai2d_merged": 10,
-  "FineVision-geo170k(qa)": 10,
-  "FineVision-geo170k_qa_": 0,
-  "FineVision-geometry3k(mathv360k)": 10,
-  "FineVision-geometry3k_mathv360k_": 0,
-  "FineVision-raven": 10,
-  "FineVision-scienceqa": 10,
-  "FineVision-tqa": 10,
-  "FineVision-visualwebinstruct(filtered)": 10,
-  "FineVision-visualwebinstruct_filtered_": 0,
-  "GameQA-140K": 10,
-  "LLaVA-CoT": 10,
-  "MMK12": 10,
-  "MMR1": 10,
-  "PuzzleQA": 10,
-  "ViRL39K": 10,
-  "VisualSphinx": 10,
-  "WaltonColdStart": 10,
-  "WeMath2-Pro": 10,
-  "WeMath2-SFT": 10,
-  "WeMath2-Standard": 10,
-  "Zebra-CoT-Physics": 10,
-  "mmopenr1-8k": 10
+  "MMR1": 10
 }
