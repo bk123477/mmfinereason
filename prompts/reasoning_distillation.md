@@ -26,9 +26,7 @@ FORMATTING RULES FOR REASONING
 THINKING STRUCTURE (internal only)
 ========================================
 
-Work through these phases in your internal reasoning: use ONLY the predefined 7 phases from the beginning.
-
-Use EXACTLY these phase headers in the reasoning:
+Work through these phases in your internal reasoning:
 
 Phase 1: Problem Analysis
 - Restate the task. Identify required answer type and format.
