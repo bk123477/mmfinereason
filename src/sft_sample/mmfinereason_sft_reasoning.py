@@ -167,6 +167,12 @@ def main():
         action="store_true",
         help="Skip samples already present in existing output JSON files",
     )
+    parser.add_argument(
+        "--retry-index",
+        type=int,
+        default=None,
+        help="Re-generate only the sample with this _index (requires --subsets and --output-dir)",
+    )
     # Generation config (Qwen3 recommended defaults)
     parser.add_argument("--temperature",        type=float, default=1.0,   help="Sampling temperature (default: 1.0)")
     parser.add_argument("--top-p",              type=float, default=0.95,  help="Top-p nucleus sampling (default: 0.95)")
@@ -248,14 +254,38 @@ def main():
         image_dir = os.path.join(dataset_root, "mmfinereason_images", subset_name)
         output_path = os.path.join(args.output_dir, f"{subset_name}_reasoning.json")
 
-        # Load existing results for --resume
+        # Load existing results for resume
+        # Auto-resume if output file already exists (whether --resume flag is set or not)
         done_indices = set()
         subset_results = []
-        if args.resume and os.path.exists(output_path):
+        if os.path.exists(output_path):
             with open(output_path, "r", encoding="utf-8") as f:
                 subset_results = json.load(f)
             done_indices = {r.get("_index") for r in subset_results}
-            print(f"  [RESUME] Already done: {len(done_indices)} sample(s)")
+            if done_indices:
+                print(f"  [RESUME] Already done: {len(done_indices)} sample(s) — skipping")
+
+        # ── --retry-index: re-generate a single specific sample ──
+        if args.retry_index is not None:
+            target = next((s for s in samples if s.get("_index") == args.retry_index), None)
+            if target is None:
+                print(f"  [ERROR] _index {args.retry_index} not found in metadata.")
+                continue
+            print(f"  [RETRY] Re-generating _index={args.retry_index} ...")
+            result = process_sample(client, args.model, template, target, image_dir, gen_config)
+            status = "OK" if not str(result["response"]).startswith("Error") else "ERR"
+            print(f"  → {status}")
+
+            # Replace existing entry or insert if missing, then sort by _index
+            subset_results = [r for r in subset_results if r.get("_index") != args.retry_index]
+            subset_results.append(result)
+            subset_results.sort(key=lambda r: r.get("_index", 0))
+
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(subset_results, f, ensure_ascii=False, indent=2)
+            print(f"  Saved → {output_path}")
+            overall_results[subset_name] = len(subset_results)
+            continue  # skip normal loop for this subset
 
         pending = [s for s in samples if s.get("_index") not in done_indices]
         if not pending:
@@ -267,6 +297,7 @@ def main():
             print(f"  [{i+1}/{len(pending)}] {subset_name}_{sample.get('_index', i)}", end=" ", flush=True)
             result = process_sample(client, args.model, template, sample, image_dir, gen_config)
             subset_results.append(result)
+            subset_results.sort(key=lambda r: r.get("_index", 0))
             status = "OK" if not str(result["response"]).startswith("Error") else "ERR"
             print(f"→ {status}")
             # Save after every sample so Ctrl+C mid-subset loses nothing
