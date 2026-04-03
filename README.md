@@ -93,42 +93,103 @@ Calls OpenRouter API (Qwen3-235B-Thinking) and saves structured reasoning to a t
 ```bash
 python src/sft_sample/mmfinereason_sft_reasoning.py \
   --api-key $OPENROUTER_API_KEY \
+  --model qwen/qwen3-235b-a22b \
   --samples 10
 ```
 
-Key options:
-```
---api-key KEY          OpenRouter API key (or set OPENROUTER_API_KEY env var)
---samples N            Samples per subset to process (default: 10)
---subsets A B C        Process specific subsets only
---output-dir PATH      Custom output folder (auto-generates timestamped dir if omitted)
---resume               Resume from a previous run (skip already-processed samples)
---template PATH        Path to prompt template (default: prompts/reasoning_distillation.md)
-```
+---
 
-Generation config (Qwen3.5 recommended):
-```
---temperature 1.0
---top-p 0.95
---top-k 20
---min-p 0.0
---presence-penalty 1.5
---max-tokens 81920
-```
+#### Arguments
 
-**Resume after interruption (Ctrl+C):**
+**필수 인자**
+
+| 인자 | 설명 |
+|------|------|
+| `--api-key KEY` | OpenRouter API Key |
+| `--model MODEL` | 사용할 모델 ID (예: `qwen/qwen3-235b-a22b`) |
+
+**실행 범위 제어**
+
+| 인자 | 기본값 | 설명 |
+|------|--------|------|
+| `--samples N` | 전체 | subset당 처리할 샘플 수 |
+| `--subsets A B C` | 전체 | 처리할 subset 이름 (공백으로 여러 개 지정 가능) |
+| `--data-dir PATH` | `data/metadata/` | `*_metadata.json` 파일들이 있는 디렉토리 |
+
+**출력 경로**
+
+| 인자 | 기본값 | 설명 |
+|------|--------|------|
+| `--output-dir PATH` | `data/reasoning/reasoning_YYYYMMDD_HHMMSS/` | 결과 저장 폴더 (생략 시 타임스탬프 자동 생성) |
+| `--template-path PATH` | `prompts/reasoning_distillation.md` | 사용할 reasoning 프롬프트 파일 경로 |
+
+**재개 / 재생성**
+
+| 인자 | 설명 |
+|------|------|
+| `--resume` | 이미 처리된 샘플 스킵 (기존 `--output-dir` 지정 시 자동 적용됨) |
+| `--retry-index N` | 특정 `_index`의 샘플 하나만 재생성 (`--subsets`, `--output-dir`과 함께 사용) |
+
+**Generation Config** (Qwen3 권장값이 기본값으로 설정됨)
+
+| 인자 | 기본값 | 설명 |
+|------|--------|------|
+| `--temperature` | `1.0` | 샘플링 온도 |
+| `--top-p` | `0.95` | Nucleus sampling |
+| `--top-k` | `20` | Top-k sampling (OpenRouter extra_body) |
+| `--min-p` | `0.0` | Min-p sampling (OpenRouter extra_body) |
+| `--presence-penalty` | `1.5` | 반복 억제 (OpenAI 호환 파라미터) |
+| `--repetition-penalty` | `1.0` | 반복 패널티 (OpenRouter extra_body) |
+| `--n` | `1` | 샘플당 생성 개수 |
+| `--max-tokens` | `81920` | 최대 출력 토큰 수 |
+
+---
+
+#### 사용 예시
+
+**전체 subset 처리 (10샘플씩)**
 ```bash
 python src/sft_sample/mmfinereason_sft_reasoning.py \
   --api-key $OPENROUTER_API_KEY \
+  --model qwen/qwen3-235b-a22b \
+  --samples 10
+```
+
+**특정 subset만 처리**
+```bash
+python src/sft_sample/mmfinereason_sft_reasoning.py \
+  --api-key $OPENROUTER_API_KEY \
+  --model qwen/qwen3-235b-a22b \
+  --subsets BMMR Zebra-CoT-Physics
+```
+
+**중단된 run 이어서 실행 (Ctrl+C 후 재개)**
+```bash
+python src/sft_sample/mmfinereason_sft_reasoning.py \
+  --api-key $OPENROUTER_API_KEY \
+  --model qwen/qwen3-235b-a22b \
+  --output-dir data/reasoning/reasoning_20260401_212153
+# 기존 폴더 지정 시 완료된 샘플은 자동 스킵 (--resume 생략 가능)
+```
+
+**오류난 샘플 하나만 콕 집어 재생성**
+```bash
+python src/sft_sample/mmfinereason_sft_reasoning.py \
+  --api-key $OPENROUTER_API_KEY \
+  --model qwen/qwen3-235b-a22b \
   --output-dir data/reasoning/reasoning_20260401_212153 \
-  --resume
+  --subsets BMMR \
+  --retry-index 3
+# _index=3인 샘플만 재생성 후 JSON 내 _index 순서 유지하여 저장
 ```
 
-**Run a single subset:**
+**다른 모델로 새 실험 run 생성 (웹 뷰어에서 비교 가능)**
 ```bash
 python src/sft_sample/mmfinereason_sft_reasoning.py \
   --api-key $OPENROUTER_API_KEY \
-  --subsets BMMR
+  --model qwen/qwen3-30b-a3b \
+  --samples 10
+# 새 타임스탬프 폴더에 자동 저장 → 웹 뷰어 Compare 모드로 비교 가능
 ```
 
 ---
