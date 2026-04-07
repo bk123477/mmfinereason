@@ -4,24 +4,38 @@ from flask import Flask, render_template, jsonify, send_from_directory, abort
 
 app = Flask(__name__)
 
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-META_DIR   = os.path.join(BASE_DIR, "data", "metadata")
-REASON_DIR = os.path.join(BASE_DIR, "data", "reasoning")
-IMAGE_BASE = os.path.join(BASE_DIR, "mmfinereason_images")
+BASE_DIR              = os.path.dirname(os.path.abspath(__file__))
+META_DIR              = os.path.join(BASE_DIR, "data", "metadata")
+REASON_DIR            = os.path.join(BASE_DIR, "data", "reasoning")
+REASON_WITH_REF_DIR   = os.path.join(BASE_DIR, "data", "reasoning_with_ref")
+REASON_NOTHINK_DIR    = os.path.join(BASE_DIR, "data", "reasoning_nothink")
+REASON_THINK_DIR      = os.path.join(BASE_DIR, "data", "reasoning_think")
+IMAGE_BASE            = os.path.join(BASE_DIR, "mmfinereason_images")
+POST_FILTERING_DIR    = os.path.join(BASE_DIR, "post_filtering")
+
+ALL_REASON_DIRS = [
+    REASON_DIR,
+    REASON_WITH_REF_DIR,
+    REASON_NOTHINK_DIR,
+    REASON_THINK_DIR,
+]
 
 
 # ── Helpers ────────────────────────────────────────────────
 
 def list_runs():
-    """Return sorted list of timestamped run-folder names under REASON_DIR."""
-    if not os.path.exists(REASON_DIR):
-        return []
-    runs = sorted(
-        d for d in os.listdir(REASON_DIR)
-        if os.path.isdir(os.path.join(REASON_DIR, d))
-        and d.startswith("reasoning_")
-    )
-    return runs  # newest last; reverse for display (newest first)
+    """Return sorted list of timestamped run-folder names, newest first.
+    Scans all reasoning variant directories."""
+    runs = []
+    for base_dir in ALL_REASON_DIRS:
+        if not os.path.exists(base_dir):
+            continue
+        runs += [
+            d for d in os.listdir(base_dir)
+            if os.path.isdir(os.path.join(base_dir, d))
+            and d.startswith("reasoning_")
+        ]
+    return sorted(runs, reverse=True)  # newest first
 
 
 def build_entry(r_item, meta_by_index):
@@ -49,9 +63,15 @@ def build_entry(r_item, meta_by_index):
 
 
 def load_subsets_for_run(run_name):
-    """Load all subset entries from a specific run folder."""
-    run_dir = os.path.join(REASON_DIR, run_name)
-    if not os.path.isdir(run_dir):
+    """Load all subset entries from a specific run folder.
+    Searches both data/reasoning/ and data/reasoning_with_ref/."""
+    run_dir = None
+    for base_dir in ALL_REASON_DIRS:
+        candidate = os.path.join(base_dir, run_name)
+        if os.path.isdir(candidate):
+            run_dir = candidate
+            break
+    if run_dir is None:
         return []
 
     subsets = []
@@ -176,6 +196,98 @@ def serve_image(filepath):
     directory = os.path.dirname(os.path.join(IMAGE_BASE, filepath))
     filename  = os.path.basename(filepath)
     return send_from_directory(directory, filename)
+
+
+# ── Post-filtering helpers ─────────────────────────────────
+
+def list_postfilter_runs():
+    """Return sorted list of post-filtering run folder names, newest first."""
+    if not os.path.exists(POST_FILTERING_DIR):
+        return []
+    runs = [
+        d for d in os.listdir(POST_FILTERING_DIR)
+        if os.path.isdir(os.path.join(POST_FILTERING_DIR, d))
+        and d.startswith("post_filtering_")
+    ]
+    return sorted(runs, reverse=True)
+
+
+def load_postfilter_run(run_name):
+    """Load all subset entries from a post-filtering run folder."""
+    run_dir = os.path.join(POST_FILTERING_DIR, run_name)
+    if not os.path.isdir(run_dir):
+        return []
+
+    subsets = []
+    reason_files = sorted(
+        f for f in os.listdir(run_dir)
+        if f.endswith("_reasoning.json")
+        and f not in ("reasoning_summary.json", "post_filter_summary.json")
+    )
+
+    for rf in reason_files:
+        subset_name = rf.replace("_reasoning.json", "")
+        file_path   = os.path.join(run_dir, rf)
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            entries = data if isinstance(data, list) else [data]
+        except Exception as e:
+            print(f"[WARN] Cannot load {file_path}: {e}")
+            continue
+
+        processed = []
+        for item in entries:
+            image_abs = item.get("image_path", "") or ""
+            image_rel = ""
+            if image_abs and os.path.exists(image_abs):
+                try:
+                    image_rel = os.path.relpath(image_abs, IMAGE_BASE)
+                except ValueError:
+                    image_rel = ""
+
+            processed.append({
+                "index":              item.get("_index", 0),
+                "question":           item.get("question", ""),
+                "options":            item.get("options"),
+                "image_rel":          image_rel,
+                "answer":             item.get("answer", ""),
+                "source_run":         item.get("source_run", ""),
+                "reasoning_original": item.get("reasoning_original", ""),
+                "response_original":  item.get("response_original", ""),
+                "reasoning_modified": bool(item.get("reasoning_modified", False)),
+                "response_modified":  bool(item.get("response_modified", False)),
+                "reasoning":          item.get("reasoning", ""),
+                "response":           item.get("response", ""),
+            })
+
+        subsets.append({"name": subset_name, "entries": processed})
+
+    return subsets
+
+
+# ── Post-filtering routes ──────────────────────────────────
+
+@app.route("/api/postfilter/runs")
+def api_postfilter_runs():
+    return jsonify(list_postfilter_runs())
+
+
+@app.route("/api/postfilter/run/<run_name>/subsets")
+def api_postfilter_subsets(run_name):
+    subsets = load_postfilter_run(run_name)
+    return jsonify([{"name": s["name"], "count": len(s["entries"])} for s in subsets])
+
+
+@app.route("/api/postfilter/run/<run_name>/subset/<int:s_idx>/sample/<int:e_idx>")
+def api_postfilter_entry(run_name, s_idx, e_idx):
+    subsets = load_postfilter_run(run_name)
+    if s_idx < 0 or s_idx >= len(subsets):
+        abort(404)
+    entries = subsets[s_idx]["entries"]
+    if e_idx < 0 or e_idx >= len(entries):
+        abort(404)
+    return jsonify(entries[e_idx])
 
 
 if __name__ == "__main__":

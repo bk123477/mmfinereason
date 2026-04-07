@@ -167,6 +167,36 @@
     }
     #btnStats:hover { background: #30363d; color: #e1e4e8; }
 
+    /* ── Post-filter button ── */
+    #btnPostFilter {
+      background: #21262d; color: #8b949e;
+      border: 1px solid #30363d; border-radius: 6px;
+      padding: 5px 12px; font-size: 0.82rem; cursor: pointer;
+      white-space: nowrap; transition: all .15s;
+    }
+    #btnPostFilter.active { background: #1a2332; color: #58a6ff; border-color: #58a6ff55; }
+
+    /* Post-filter run selector */
+    .run-select.run-pf { color: #58a6ff; border-color: #58a6ff55; }
+
+    /* Modification badge in sub-label */
+    .mod-badge {
+      display: inline-block;
+      background: #1f3d1f; color: #3fb950;
+      border: 1px solid #3fb95055; border-radius: 3px;
+      font-size: 0.62rem; font-weight: 700;
+      padding: 1px 5px; margin-left: 6px;
+      vertical-align: middle; text-transform: uppercase; letter-spacing: .04em;
+    }
+    .unchanged-badge {
+      display: inline-block;
+      background: #21262d; color: #484f58;
+      border: 1px solid #30363d; border-radius: 3px;
+      font-size: 0.62rem; font-weight: 600;
+      padding: 1px 5px; margin-left: 6px;
+      vertical-align: middle; text-transform: uppercase; letter-spacing: .04em;
+    }
+
     /* ── Stats modal ── */
     #statsOverlay {
       display: none; position: fixed; inset: 0; z-index: 100;
@@ -235,6 +265,9 @@
   <!-- Compare toggle -->
   <button id="btnCompare">⇄ Compare</button>
 
+  <!-- Post-filter toggle -->
+  <button id="btnPostFilter">🔧 Post-filter</button>
+
   <!-- Normal mode: single Run -->
   <div id="normalControls" class="select-group">
     <span class="select-label">Run</span>
@@ -243,6 +276,12 @@
       <option value="{{ r }}">{{ r }}</option>
       {% endfor %}
     </select>
+  </div>
+
+  <!-- Post-filter mode: post-filter run selector -->
+  <div id="postfilterControls" style="display:none; gap:8px;" class="select-group">
+    <span class="select-label">Post-filter Run</span>
+    <select id="pfRunSelect" class="run-select run-pf"></select>
   </div>
 
   <!-- Compare mode: Run A + Run B -->
@@ -286,6 +325,8 @@
   <span class="kbd">Run Dropdown</span> 실험 버전 선택
   <span class="g-sep">|</span>
   <span class="kbd">⇄ Compare</span> 두 버전 비교 모드
+  <span class="g-sep">|</span>
+  <span class="kbd">🔧 Post-filter</span> 원본 vs 후처리 비교
   <span class="g-sep">|</span>
   각 영역 <strong style="color:#c9d1d9">독립 스크롤</strong>
 </div>
@@ -335,14 +376,14 @@
       <div id="leftCompare" style="display:none; height:100%; display:none; flex-direction:column;">
         <div class="sub-panel main">
           <div class="sub-label">
-            <span>reasoning</span>
+            <span id="leftReasonLabel">reasoning</span>
             <span class="char-count" id="cmpAReasonCount"></span>
           </div>
           <div class="sub-content" id="cmpAReasoning">—</div>
         </div>
         <div class="sub-panel minor">
           <div class="sub-label">
-            <span>response</span>
+            <span id="leftRespLabel">response</span>
             <span class="char-count" id="cmpARespCount"></span>
           </div>
           <div class="sub-content" id="cmpAResponse">—</div>
@@ -379,14 +420,14 @@
       <div id="rightCompare" style="display:none; height:100%; display:none; flex-direction:column;">
         <div class="sub-panel main">
           <div class="sub-label">
-            <span>reasoning</span>
+            <span id="rightReasonLabel">reasoning</span>
             <span class="char-count" id="cmpBReasonCount"></span>
           </div>
           <div class="sub-content" id="cmpBReasoning">—</div>
         </div>
         <div class="sub-panel minor">
           <div class="sub-label">
-            <span>response</span>
+            <span id="rightRespLabel">response</span>
             <span class="char-count" id="cmpBRespCount"></span>
           </div>
           <div class="sub-content" id="cmpBResponse">—</div>
@@ -415,16 +456,24 @@
 
 <script>
   // ── State ──────────────────────────────────────────────
-  let compareMode = false;
+  let compareMode    = false;
+  let postFilterMode = false;
   let curRun    = '';
   let SUBSETS   = [];
   let curSubset = 0;
   let curSample = 0;
 
   // ── DOM refs ───────────────────────────────────────────
-  const btnCompare      = document.getElementById('btnCompare');
-  const normalControls  = document.getElementById('normalControls');
-  const compareControls = document.getElementById('compareControls');
+  const btnCompare        = document.getElementById('btnCompare');
+  const btnPostFilter     = document.getElementById('btnPostFilter');
+  const normalControls    = document.getElementById('normalControls');
+  const compareControls   = document.getElementById('compareControls');
+  const postfilterControls= document.getElementById('postfilterControls');
+  const pfRunSelect       = document.getElementById('pfRunSelect');
+  const leftReasonLabel   = document.getElementById('leftReasonLabel');
+  const leftRespLabel     = document.getElementById('leftRespLabel');
+  const rightReasonLabel  = document.getElementById('rightReasonLabel');
+  const rightRespLabel    = document.getElementById('rightRespLabel');
   const runSelect       = document.getElementById('runSelect');
   const runSelectA      = document.getElementById('runSelectA');
   const runSelectB      = document.getElementById('runSelectB');
@@ -512,19 +561,20 @@
 
   // ── Toggle compare mode ─────────────────────────────────
   function setCompareMode(on) {
-    compareMode = on;
+    compareMode    = on;
+    postFilterMode = false;
     btnCompare.classList.toggle('active', on);
+    btnPostFilter.classList.remove('active');
 
-    normalControls.style.display  = on ? 'none' : 'flex';
-    compareControls.style.display = on ? 'flex'  : 'none';
+    normalControls.style.display     = on ? 'none' : 'flex';
+    compareControls.style.display    = on ? 'flex'  : 'none';
+    postfilterControls.style.display = 'none';
 
-    // Column visibility
     leftNormal.style.display   = on ? 'none'  : 'contents';
     rightNormal.style.display  = on ? 'none'  : 'contents';
     leftCompare.style.display  = on ? 'flex'  : 'none';
     rightCompare.style.display = on ? 'flex'  : 'none';
 
-    // Answer badge in question panel
     answerBadge.style.display = on ? 'block' : 'none';
 
     if (on) {
@@ -532,11 +582,131 @@
       rightTitle.textContent = `Run B · ${runSelectB.value}`;
       document.querySelector('#leftHeader .dot').className  = 'dot dot-orange';
       document.querySelector('#rightHeader .dot').className = 'dot dot-purple';
+      // Reset sub-labels to compare defaults
+      leftReasonLabel.textContent  = 'reasoning';
+      leftRespLabel.textContent    = 'response';
+      rightReasonLabel.textContent = 'reasoning';
+      rightRespLabel.textContent   = 'response';
     } else {
       leftTitle.textContent  = 'Reference · Qwen3-VL-235B-Thinking';
       rightTitle.textContent = 'Model Output · OpenRouter';
       document.querySelector('#leftHeader .dot').className  = 'dot dot-green';
       document.querySelector('#rightHeader .dot').className = 'dot dot-blue';
+    }
+  }
+
+  // ── Toggle post-filter mode ─────────────────────────────
+  function setPostFilterMode(on) {
+    postFilterMode = on;
+    compareMode    = false;
+    btnPostFilter.classList.toggle('active', on);
+    btnCompare.classList.remove('active');
+
+    normalControls.style.display     = on ? 'none' : 'flex';
+    compareControls.style.display    = 'none';
+    postfilterControls.style.display = on ? 'flex'  : 'none';
+
+    leftNormal.style.display   = on ? 'none'  : 'contents';
+    rightNormal.style.display  = on ? 'none'  : 'contents';
+    leftCompare.style.display  = on ? 'flex'  : 'none';
+    rightCompare.style.display = on ? 'flex'  : 'none';
+
+    answerBadge.style.display = on ? 'block' : 'none';
+
+    if (on) {
+      leftTitle.textContent  = 'Original';
+      rightTitle.textContent = 'Post-filtered';
+      document.querySelector('#leftHeader .dot').className  = 'dot dot-orange';
+      document.querySelector('#rightHeader .dot').className = 'dot dot-blue';
+      leftReasonLabel.innerHTML  = 'original reasoning';
+      leftRespLabel.innerHTML    = 'original response';
+      rightReasonLabel.innerHTML = 'filtered reasoning';
+      rightRespLabel.innerHTML   = 'filtered response';
+    } else {
+      leftTitle.textContent  = 'Reference · Qwen3-VL-235B-Thinking';
+      rightTitle.textContent = 'Model Output · OpenRouter';
+      document.querySelector('#leftHeader .dot').className  = 'dot dot-green';
+      document.querySelector('#rightHeader .dot').className = 'dot dot-blue';
+    }
+  }
+
+  // ── Load post-filter sample ─────────────────────────────
+  async function loadPostFilterSample(sIdx, eIdx) {
+    curSubset = sIdx; curSample = eIdx;
+    subsetSelect.value = sIdx;
+    updatePagination();
+    questionText.textContent = 'Loading…';
+
+    const pfRun = pfRunSelect.value;
+    if (!pfRun) return;
+
+    let data = null;
+    try {
+      const r = await fetch(
+        `/api/postfilter/run/${encodeURIComponent(pfRun)}/subset/${sIdx}/sample/${eIdx}`
+      );
+      if (r.ok) data = await r.json();
+    } catch { data = null; }
+
+    if (!data) {
+      questionText.textContent = '(not found in post-filter run)';
+      return;
+    }
+
+    applyImage(data);
+    applyQuestion(data, SUBSETS[sIdx]?.name);
+    answerValue.textContent = data.answer || '(no answer)';
+
+    // Left: original
+    const origR = data.reasoning_original || '(empty)';
+    const origP = data.response_original  || '(empty)';
+    cmpAReasoning.textContent   = origR;
+    cmpAReasonCount.textContent = charCount(origR);
+    cmpAResponse.textContent    = origP;
+    cmpARespCount.textContent   = charCount(origP);
+
+    // Right: filtered — show modification badges
+    const filtR = data.reasoning || '(empty)';
+    const filtP = data.response  || '(empty)';
+    cmpBReasoning.textContent   = filtR;
+    cmpBReasonCount.textContent = charCount(filtR);
+    cmpBResponse.textContent    = filtP;
+    cmpBRespCount.textContent   = charCount(filtP);
+
+    // Update right-side labels with modification badges
+    rightReasonLabel.innerHTML = data.reasoning_modified
+      ? 'filtered reasoning <span class="mod-badge">✓ edited</span>'
+      : 'filtered reasoning <span class="unchanged-badge">unchanged</span>';
+    rightRespLabel.innerHTML = data.response_modified
+      ? 'filtered response <span class="mod-badge">✓ edited</span>'
+      : 'filtered response <span class="unchanged-badge">unchanged</span>';
+
+    rightTitle.textContent = `Post-filtered · ${pfRun}`;
+
+    scrollTop();
+  }
+
+  // ── Populate post-filter run selector ──────────────────
+  async function loadPostFilterRuns() {
+    try {
+      const r    = await fetch('/api/postfilter/runs');
+      const runs = await r.json();
+      pfRunSelect.innerHTML = '';
+      if (runs.length === 0) {
+        const opt = document.createElement('option');
+        opt.textContent = '(no post-filter runs found)';
+        opt.disabled = true;
+        pfRunSelect.appendChild(opt);
+      } else {
+        runs.forEach(run => {
+          const opt = document.createElement('option');
+          opt.value = run;
+          opt.textContent = run;
+          pfRunSelect.appendChild(opt);
+        });
+      }
+    } catch (e) {
+      console.error('Failed to load post-filter runs:', e);
     }
   }
 
@@ -640,16 +810,39 @@
 
   // Unified load dispatcher
   function doLoad(sIdx, eIdx) {
-    if (compareMode) loadCompareSample(sIdx, eIdx);
-    else             loadSample(sIdx, eIdx);
+    if (postFilterMode)  loadPostFilterSample(sIdx, eIdx);
+    else if (compareMode) loadCompareSample(sIdx, eIdx);
+    else                  loadSample(sIdx, eIdx);
   }
 
   // ── Event listeners ────────────────────────────────────
+  btnPostFilter.addEventListener('click', async () => {
+    const next = !postFilterMode;
+    setPostFilterMode(next);
+    if (next) {
+      await loadPostFilterRuns();
+      if (pfRunSelect.options.length > 0 && !pfRunSelect.options[0].disabled) {
+        // Load subsets from the current normal run (for navigation)
+        const resp = await fetch(`/api/run/${encodeURIComponent(runSelect.value)}/subsets`);
+        SUBSETS = await resp.json();
+        rebuildSubsetDropdown();
+        curSubset = 0; curSample = 0;
+        updatePagination();
+        if (SUBSETS.length) loadPostFilterSample(0, 0);
+      }
+    } else {
+      loadRun(runSelect.value);
+    }
+  });
+
+  pfRunSelect.addEventListener('change', () => {
+    if (SUBSETS.length) loadPostFilterSample(curSubset, curSample);
+  });
+
   btnCompare.addEventListener('click', async () => {
-    const next = !compareMode;
+    const next = postFilterMode ? true : !compareMode;
     setCompareMode(next);
     if (next) {
-      // Compare mode: load subsets from Run A (reference)
       const resp = await fetch(`/api/run/${encodeURIComponent(runSelectA.value)}/subsets`);
       SUBSETS = await resp.json();
       rebuildSubsetDropdown();
@@ -661,7 +854,10 @@
     }
   });
 
-  runSelect.addEventListener('change',  e => loadRun(e.target.value));
+  runSelect.addEventListener('change', e => {
+    if (postFilterMode) setPostFilterMode(false);
+    loadRun(e.target.value);
+  });
   runSelectA.addEventListener('change', async e => {
     // Refresh subset list from new Run A
     const resp = await fetch(`/api/run/${encodeURIComponent(e.target.value)}/subsets`);
