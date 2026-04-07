@@ -290,6 +290,56 @@ def api_postfilter_entry(run_name, s_idx, e_idx):
     return jsonify(entries[e_idx])
 
 
+@app.route("/api/postfilter/run/<run_name>/stats")
+def api_postfilter_stats(run_name):
+    """Return per-subset and total char-length statistics for post-filtered reasoning & response."""
+    subsets = load_postfilter_run(run_name)
+    rows = []
+    total_r, total_p, total_n = 0, 0, 0
+
+    for s in subsets:
+        entries = s["entries"]
+        n = len(entries)
+        if n == 0:
+            rows.append({
+                "subset": s["name"], "count": 0,
+                "avg_reasoning": None, "avg_response": None,
+                "min_reasoning": None, "max_reasoning": None,
+                "min_response":  None, "max_response":  None,
+            })
+            continue
+
+        r_lens = [len(e.get("reasoning") or "") for e in entries]
+        p_lens = [len(e.get("response")  or "") for e in entries]
+
+        avg_r = round(sum(r_lens) / n)
+        avg_p = round(sum(p_lens) / n)
+        total_r += sum(r_lens)
+        total_p += sum(p_lens)
+        total_n += n
+
+        rows.append({
+            "subset":        s["name"],
+            "count":         n,
+            "avg_reasoning": avg_r,
+            "avg_response":  avg_p,
+            "min_reasoning": min(r_lens),
+            "max_reasoning": max(r_lens),
+            "min_response":  min(p_lens),
+            "max_response":  max(p_lens),
+        })
+
+    total_row = {
+        "subset":        "TOTAL",
+        "count":         total_n,
+        "avg_reasoning": round(total_r / total_n) if total_n else None,
+        "avg_response":  round(total_p / total_n) if total_n else None,
+        "min_reasoning": None, "max_reasoning": None,
+        "min_response":  None, "max_response":  None,
+    }
+    return jsonify({"run": run_name, "subsets": rows, "total": total_row})
+
+
 if __name__ == "__main__":
     print("MMFineReason Visualizer starting...")
     print("Open http://127.0.0.1:5002 in your browser.")
