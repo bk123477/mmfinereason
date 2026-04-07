@@ -176,6 +176,15 @@
     }
     #btnPostFilter.active { background: #1a2332; color: #58a6ff; border-color: #58a6ff55; }
 
+    /* ── PF Solo button ── */
+    #btnPfSolo {
+      background: #21262d; color: #8b949e;
+      border: 1px solid #30363d; border-radius: 6px;
+      padding: 5px 12px; font-size: 0.82rem; cursor: pointer;
+      white-space: nowrap; transition: all .15s;
+    }
+    #btnPfSolo.active { background: #1f2d3d; color: #79c0ff; border-color: #79c0ff55; }
+
     /* Post-filter run selector */
     .run-select.run-pf { color: #58a6ff; border-color: #58a6ff55; }
 
@@ -267,6 +276,9 @@
 
   <!-- Post-filter toggle -->
   <button id="btnPostFilter">🔧 Post-filter</button>
+
+  <!-- Post-filter solo toggle -->
+  <button id="btnPfSolo">📋 PF View</button>
 
   <!-- Normal mode: single Run -->
   <div id="normalControls" class="select-group">
@@ -362,7 +374,7 @@
       <div id="leftNormal" style="display:contents;">
         <div class="sub-panel main">
           <div class="sub-label">
-            <span>qwen3vl_235b_thinking_response</span>
+            <span id="refThinkLabel">qwen3vl_235b_thinking_response</span>
             <span class="char-count" id="refThinkCount"></span>
           </div>
           <div class="sub-content" id="refThinking">—</div>
@@ -458,6 +470,7 @@
   // ── State ──────────────────────────────────────────────
   let compareMode    = false;
   let postFilterMode = false;
+  let pfSoloMode     = false;
   let curRun    = '';
   let SUBSETS   = [];
   let curSubset = 0;
@@ -466,6 +479,7 @@
   // ── DOM refs ───────────────────────────────────────────
   const btnCompare        = document.getElementById('btnCompare');
   const btnPostFilter     = document.getElementById('btnPostFilter');
+  const btnPfSolo         = document.getElementById('btnPfSolo');
   const normalControls    = document.getElementById('normalControls');
   const compareControls   = document.getElementById('compareControls');
   const postfilterControls= document.getElementById('postfilterControls');
@@ -495,6 +509,7 @@
   const refThinking   = document.getElementById('refThinking');
   const refAnswer     = document.getElementById('refAnswer');
   const refThinkCount = document.getElementById('refThinkCount');
+  const refThinkLabel = document.getElementById('refThinkLabel');
   const ourReasoning  = document.getElementById('ourReasoning');
   const ourResponse   = document.getElementById('ourResponse');
   const ourReasonCount= document.getElementById('ourReasonCount');
@@ -563,8 +578,11 @@
   function setCompareMode(on) {
     compareMode    = on;
     postFilterMode = false;
+    pfSoloMode     = false;
     btnCompare.classList.toggle('active', on);
     btnPostFilter.classList.remove('active');
+    btnPfSolo.classList.remove('active');
+    refThinkLabel.textContent = 'qwen3vl_235b_thinking_response';
 
     normalControls.style.display     = on ? 'none' : 'flex';
     compareControls.style.display    = on ? 'flex'  : 'none';
@@ -599,8 +617,11 @@
   function setPostFilterMode(on) {
     postFilterMode = on;
     compareMode    = false;
+    pfSoloMode     = false;
     btnPostFilter.classList.toggle('active', on);
     btnCompare.classList.remove('active');
+    btnPfSolo.classList.remove('active');
+    refThinkLabel.textContent = 'qwen3vl_235b_thinking_response';
 
     normalControls.style.display     = on ? 'none' : 'flex';
     compareControls.style.display    = 'none';
@@ -628,6 +649,84 @@
       document.querySelector('#leftHeader .dot').className  = 'dot dot-green';
       document.querySelector('#rightHeader .dot').className = 'dot dot-blue';
     }
+  }
+
+  // ── Toggle PF solo mode ─────────────────────────────────
+  function setPfSoloMode(on) {
+    pfSoloMode     = on;
+    compareMode    = false;
+    postFilterMode = false;
+    btnPfSolo.classList.toggle('active', on);
+    btnCompare.classList.remove('active');
+    btnPostFilter.classList.remove('active');
+
+    normalControls.style.display     = on ? 'none' : 'flex';
+    compareControls.style.display    = 'none';
+    postfilterControls.style.display = on ? 'flex'  : 'none';
+
+    leftNormal.style.display   = 'contents';
+    rightNormal.style.display  = 'contents';
+    leftCompare.style.display  = 'none';
+    rightCompare.style.display = 'none';
+
+    answerBadge.style.display = 'none';
+
+    if (on) {
+      leftTitle.textContent  = 'Original';
+      rightTitle.textContent = 'Post-filtered';
+      document.querySelector('#leftHeader .dot').className  = 'dot dot-orange';
+      document.querySelector('#rightHeader .dot').className = 'dot dot-blue';
+      refThinkLabel.textContent = 'original reasoning';
+    } else {
+      leftTitle.textContent  = 'Reference · Qwen3-VL-235B-Thinking';
+      rightTitle.textContent = 'Model Output · OpenRouter';
+      document.querySelector('#leftHeader .dot').className  = 'dot dot-green';
+      document.querySelector('#rightHeader .dot').className = 'dot dot-blue';
+      refThinkLabel.textContent = 'qwen3vl_235b_thinking_response';
+    }
+  }
+
+  // ── Load PF solo sample ─────────────────────────────────
+  async function loadPfSoloSample(sIdx, eIdx) {
+    curSubset = sIdx; curSample = eIdx;
+    subsetSelect.value = sIdx;
+    updatePagination();
+    questionText.textContent = 'Loading…';
+
+    const pfRun = pfRunSelect.value;
+    if (!pfRun) return;
+
+    let data = null;
+    try {
+      const r = await fetch(
+        `/api/postfilter/run/${encodeURIComponent(pfRun)}/subset/${sIdx}/sample/${eIdx}`
+      );
+      if (r.ok) data = await r.json();
+    } catch { data = null; }
+
+    if (!data) {
+      questionText.textContent = '(not found in post-filter run)';
+      return;
+    }
+
+    applyImage(data);
+    applyQuestion(data, SUBSETS[sIdx]?.name);
+
+    // Left: original reasoning/response
+    const origR = data.reasoning_original || '(empty)';
+    refThinking.textContent   = origR;
+    refThinkCount.textContent = charCount(origR);
+    refAnswer.textContent     = data.answer || '(no answer)';
+
+    // Right: filtered reasoning/response
+    const filtR = data.reasoning || '(empty)';
+    const filtP = data.response  || '(empty)';
+    ourReasoning.textContent   = filtR;
+    ourReasonCount.textContent = charCount(filtR);
+    ourResponse.textContent    = filtP;
+    ourRespCount.textContent   = charCount(filtP);
+
+    scrollTop();
   }
 
   // ── Load post-filter sample ─────────────────────────────
@@ -810,24 +909,28 @@
 
   // Unified load dispatcher
   function doLoad(sIdx, eIdx) {
-    if (postFilterMode)  loadPostFilterSample(sIdx, eIdx);
+    if (pfSoloMode)       loadPfSoloSample(sIdx, eIdx);
+    else if (postFilterMode) loadPostFilterSample(sIdx, eIdx);
     else if (compareMode) loadCompareSample(sIdx, eIdx);
     else                  loadSample(sIdx, eIdx);
   }
 
   // ── Event listeners ────────────────────────────────────
+  async function loadPfSubsets() {
+    const resp = await fetch(`/api/postfilter/run/${encodeURIComponent(pfRunSelect.value)}/subsets`);
+    SUBSETS = await resp.json();
+    rebuildSubsetDropdown();
+    curSubset = 0; curSample = 0;
+    updatePagination();
+  }
+
   btnPostFilter.addEventListener('click', async () => {
-    const next = !postFilterMode;
+    const next = !(postFilterMode && !pfSoloMode);
     setPostFilterMode(next);
     if (next) {
       await loadPostFilterRuns();
       if (pfRunSelect.options.length > 0 && !pfRunSelect.options[0].disabled) {
-        // Load subsets from the current normal run (for navigation)
-        const resp = await fetch(`/api/run/${encodeURIComponent(runSelect.value)}/subsets`);
-        SUBSETS = await resp.json();
-        rebuildSubsetDropdown();
-        curSubset = 0; curSample = 0;
-        updatePagination();
+        await loadPfSubsets();
         if (SUBSETS.length) loadPostFilterSample(0, 0);
       }
     } else {
@@ -835,8 +938,26 @@
     }
   });
 
-  pfRunSelect.addEventListener('change', () => {
-    if (SUBSETS.length) loadPostFilterSample(curSubset, curSample);
+  btnPfSolo.addEventListener('click', async () => {
+    const next = !(pfSoloMode);
+    setPfSoloMode(next);
+    if (next) {
+      await loadPostFilterRuns();
+      if (pfRunSelect.options.length > 0 && !pfRunSelect.options[0].disabled) {
+        await loadPfSubsets();
+        if (SUBSETS.length) loadPfSoloSample(0, 0);
+      }
+    } else {
+      loadRun(runSelect.value);
+    }
+  });
+
+  pfRunSelect.addEventListener('change', async () => {
+    await loadPfSubsets();
+    if (SUBSETS.length) {
+      if (pfSoloMode) loadPfSoloSample(0, 0);
+      else loadPostFilterSample(0, 0);
+    }
   });
 
   btnCompare.addEventListener('click', async () => {
@@ -994,11 +1115,21 @@
   }
 
   async function openStats() {
-    const runName = compareMode ? runSelectA.value : runSelect.value;
+    let runName, apiPath;
+    if (pfSoloMode || postFilterMode) {
+      runName = pfRunSelect.value;
+      apiPath = `/api/postfilter/run/${encodeURIComponent(runName)}/stats`;
+    } else if (compareMode) {
+      runName = runSelectA.value;
+      apiPath = `/api/run/${encodeURIComponent(runName)}/stats`;
+    } else {
+      runName = runSelect.value;
+      apiPath = `/api/run/${encodeURIComponent(runName)}/stats`;
+    }
     statsContent.innerHTML = 'Loading…';
     statsOverlay.classList.add('open');
     try {
-      const resp = await fetch(`/api/run/${encodeURIComponent(runName)}/stats`);
+      const resp = await fetch(apiPath);
       const data = await resp.json();
       renderStats(data);
     } catch(e) {

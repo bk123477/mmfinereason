@@ -1,14 +1,20 @@
 """
-post_filter.py  —  2-step post-filtering pipeline
+post_filter.py  —  Async iterative post-filtering pipeline
 
 Step 1 (Detection):
   Send full reasoning + response to LLM.
   Model returns {c1, c2, c3, c4} booleans (tiny output → reliable).
-  If no issues found → sample is saved as-is (0 rewrites for clean samples).
+  If no issues found → sample is saved as-is.
 
 Step 2 (Rewrite, only when issues detected):
   Send the same reasoning + response with explicit issue list.
   Model rewrites ONLY what needs fixing, returns full corrected text.
+
+Step 3 (Re-detect):
+  Run detection again on the rewritten output.
+  If issues still remain, repeat rewrite. Up to --max-iterations times.
+
+Multiple samples are processed concurrently (--workers controls parallelism).
 
 Quality issues:
   C1: Reference contamination in reasoning
@@ -20,7 +26,8 @@ Usage:
   python post_filter.py \\
     --api-key YOUR_KEY \\
     --model deepseek/deepseek-v3.2 \\
-    --input-dir data/reasoning_think/reasoning_think_20260406_215604
+    --input-dir data/reasoning_think/reasoning_think_20260406_215604 \\
+    --workers 5
 
 Output: post_filtering/post_filtering_YYYYMMDD_HHMMSS/
 """
@@ -28,10 +35,10 @@ Output: post_filtering/post_filtering_YYYYMMDD_HHMMSS/
 import os
 import re
 import json
-import time
+import asyncio
 import argparse
 from datetime import datetime
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 # ── Paths ────────────────────────────────────────────────────
 
@@ -41,6 +48,10 @@ DETECT_PROMPT_DEFAULT  = os.path.join(BASE_DIR, "prompts", "post_filter_detect_p
 REWRITE_PROMPT_DEFAULT = os.path.join(BASE_DIR, "prompts", "post_filter_rewrite_prompt.md")
 META_DIR               = os.path.join(BASE_DIR, "data", "metadata")
 OUT_BASE               = os.path.join(BASE_DIR, "post_filtering")
+
+MAX_RETRIES  = 5
+RETRY_DELAYS = [10, 30, 60, 120, 180]
+PHASE_LABELS = [f"Phase {i}:" for i in range(1, 7)]
 
 # ── Prompt loader ────────────────────────────────────────────
 
@@ -53,21 +64,10 @@ def load_prompt(path: str) -> str:
 # ── JSON parsing ─────────────────────────────────────────────
 
 def fix_invalid_escapes(text: str) -> str:
-    # Fix backslash sequences invalid in JSON but common in math/LaTeX.
-    # e.g. \alpha -> \\alpha, \sigma -> \\sigma, \frac -> \\frac
-    # Valid JSON escapes after backslash: " \ / b f n r t u(+4hex)
-    # Everything else must be doubled.
     return re.sub(r'\\([^"\\/bfnrtu])', lambda m: '\\\\' + m.group(1), text)
 
 
 def parse_json_output(text: str) -> dict:
-    """
-    Robustly parse a JSON object from LLM output.
-    1) Strip markdown fences
-    2) Extract outermost { ... }
-    3) Try json.loads() directly
-    4) If that fails with invalid escape, fix LaTeX backslashes and retry
-    """
     text = text.strip()
     m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if m:
@@ -76,30 +76,28 @@ def parse_json_output(text: str) -> dict:
     end   = text.rfind("}")
     if start != -1 and end != -1:
         text = text[start : end + 1]
-
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Second attempt: fix invalid escape sequences (LaTeX, etc.) then retry
-        fixed = fix_invalid_escapes(text)
-        return json.loads(fixed)  # raises if still broken
+        return json.loads(fix_invalid_escapes(text))
 
 # ── Message builders ─────────────────────────────────────────
 
-def build_detect_message(question: str, options, reasoning: str, response: str) -> str:
-    options_str = ""
-    if options:
-        if isinstance(options, list):
-            labels = list("ABCDEFGHIJ")
-            options_str = "\n\n### Options:\n" + "\n".join(
-                f"({labels[i]}) {opt}" for i, opt in enumerate(options) if i < len(labels)
-            )
-        else:
-            options_str = f"\n\n### Options:\n{options}"
+def build_options_str(options) -> str:
+    if not options:
+        return ""
+    if isinstance(options, list):
+        labels = list("ABCDEFGHIJ")
+        return "\n\n### Options:\n" + "\n".join(
+            f"({labels[i]}) {opt}" for i, opt in enumerate(options) if i < len(labels)
+        )
+    return f"\n\n### Options:\n{options}"
 
+
+def build_detect_message(question: str, options, reasoning: str, response: str) -> str:
     return (
         f"### Question:\n{question}"
-        f"{options_str}"
+        f"{build_options_str(options)}"
         f"\n\n---\n"
         f"### Reasoning:\n{reasoning or '(empty)'}"
         f"\n\n### Response:\n{response or '(empty)'}"
@@ -110,22 +108,9 @@ def build_detect_message(question: str, options, reasoning: str, response: str) 
 
 
 def build_rewrite_message(
-    question: str, options, reasoning: str, response: str, answer: str,
-    issues: dict
+    question: str, options, reasoning: str, response: str, answer: str, issues: dict
 ) -> str:
-    options_str = ""
-    if options:
-        if isinstance(options, list):
-            labels = list("ABCDEFGHIJ")
-            options_str = "\n\n### Options:\n" + "\n".join(
-                f"({labels[i]}) {opt}" for i, opt in enumerate(options) if i < len(labels)
-            )
-        else:
-            options_str = f"\n\n### Options:\n{options}"
-
     answer_str = f"\n\n### Ground Truth Answer:\n{answer}" if answer else ""
-
-    # Build explicit issue list for the model
     flagged = []
     if issues.get("c1"): flagged.append("C1 — Reference contamination detected in reasoning")
     if issues.get("c2"): flagged.append("C2 — Phase structure violation detected in reasoning")
@@ -136,80 +121,68 @@ def build_rewrite_message(
     return (
         f"The following issues were detected and MUST be fixed:\n{issue_list}"
         f"\n\n### Question:\n{question}"
-        f"{options_str}"
+        f"{build_options_str(options)}"
         f"{answer_str}"
         f"\n\n---\n"
         f"### Reasoning (fix if needed):\n{reasoning or '(empty)'}"
         f"\n\n### Response (fix if needed):\n{response or '(empty)'}"
         f"\n\n---\n"
         f"Apply ALL the fixing rules for the flagged issues from your instructions. "
-        f"Return the complete corrected JSON. Do NOT truncate any text."
+        f"Return the complete corrected output using the XML delimiter format. Do NOT truncate."
     )
 
-# ── API call with retry ───────────────────────────────────────
+# ── Async API call ────────────────────────────────────────────
 
-MAX_RETRIES  = 5
-RETRY_DELAYS = [10, 30, 60, 120, 180]
-
-
-def call_api(client, model: str, system: str, user: str, max_tokens: int,
-             label: str) -> str | None:
-    """Call OpenRouter API with retry on rate-limit. Returns content string or None on failure."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
-                ],
-                max_tokens=max_tokens,
-                extra_body={"include_reasoning": False},
-            )
-            return resp.choices[0].message.content or ""
-
-        except Exception as e:
-            err = str(e)
-            is_rate = "429" in err or "rate" in err.lower()
-            if is_rate and attempt < MAX_RETRIES - 1:
-                wait = RETRY_DELAYS[attempt]
-                print(
-                    f"\n  [RATE LIMIT] {label} — waiting {wait}s "
-                    f"(attempt {attempt+1}/{MAX_RETRIES})...",
-                    end=" ", flush=True
+async def call_api_async(
+    client: AsyncOpenAI,
+    semaphore: asyncio.Semaphore,
+    model: str,
+    system: str,
+    user: str,
+    max_tokens: int,
+    label: str,
+) -> str | None:
+    async with semaphore:
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = await client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": user},
+                    ],
+                    max_tokens=max_tokens,
+                    extra_body={"include_reasoning": False},
                 )
-                time.sleep(wait)
-                print("retrying...", end=" ", flush=True)
-            else:
-                print(f"\n  [API ERROR] {label}: {e}")
-                return None
+                return resp.choices[0].message.content or ""
+            except Exception as e:
+                err = str(e)
+                is_rate = "429" in err or "rate" in err.lower()
+                if is_rate and attempt < MAX_RETRIES - 1:
+                    wait = RETRY_DELAYS[attempt]
+                    print(f"\n  [RATE LIMIT] {label} — waiting {wait}s (attempt {attempt+1}/{MAX_RETRIES})...")
+                    await asyncio.sleep(wait)
+                else:
+                    print(f"\n  [API ERROR] {label}: {e}")
+                    return None
     return None
 
-# ── Rule-based detection (C3 only) ───────────────────────────
-
-PHASE_LABELS = [f"Phase {i}:" for i in range(1, 7)]
-
+# ── Rule-based detection ──────────────────────────────────────
 
 def rule_detect_c3(response: str) -> bool:
-    # C3: any phase label present in response = violation (string match, never misses)
-    return any(p in response for p in PHASE_LABELS)
+    return any(p in (response or "") for p in PHASE_LABELS)
 
+# ── Detection ─────────────────────────────────────────────────
 
-# ── Step 1: Detection ─────────────────────────────────────────
-
-def detect_issues(
-    client, model: str, detect_prompt: str,
-    question: str, options, reasoning: str, response: str,
-    label: str, max_tokens: int = 512
+async def detect_issues_async(
+    client, semaphore, model, detect_prompt,
+    question, options, reasoning, response, label
 ) -> dict | None:
-    # C3: rule-based (phase labels in response — deterministic, never misses)
     c3_rule = rule_detect_c3(response)
-
-    # C1, C2, C4: LLM-based
-    # C1/C4: require semantic understanding of reference contamination
-    # C2: phase labels may all be present but appended retroactively after free-form solving
     user_msg = build_detect_message(question, options, reasoning, response)
-    raw = call_api(client, model, detect_prompt, user_msg, max_tokens, label + "/detect")
+    raw = await call_api_async(
+        client, semaphore, model, detect_prompt, user_msg, 512, label + "/detect"
+    )
     if raw is None:
         return None
     try:
@@ -217,23 +190,16 @@ def detect_issues(
         return {
             "c1": bool(llm.get("c1", False)),
             "c2": bool(llm.get("c2", False)),
-            "c3": c3_rule or bool(llm.get("c3", False)),  # rule OR LLM
+            "c3": c3_rule or bool(llm.get("c3", False)),
             "c4": bool(llm.get("c4", False)),
         }
-    except (json.JSONDecodeError, Exception) as e:
+    except Exception as e:
         print(f"\n  [WARN] Detection parse failed for {label}: {e} | raw: {raw[:200]}")
-        # LLM failed — C3 rule result still valid; C1/C2/C4 unknown → conservative
-        return {
-            "c1": True,
-            "c2": True,
-            "c3": c3_rule,
-            "c4": True,
-        }
+        return {"c1": True, "c2": True, "c3": c3_rule, "c4": True}
 
-# ── Step 2: Rewrite ───────────────────────────────────────────
+# ── Rewrite ───────────────────────────────────────────────────
 
 def parse_rewrite_output(raw: str) -> dict | None:
-    # Extract content between XML delimiters — no JSON escaping issues
     r_match = re.search(r"<REASONING>(.*?)</REASONING>", raw, re.DOTALL)
     p_match = re.search(r"<RESPONSE>(.*?)</RESPONSE>",  raw, re.DOTALL)
     if not r_match and not p_match:
@@ -244,21 +210,20 @@ def parse_rewrite_output(raw: str) -> dict | None:
     }
 
 
-def rewrite_sample(
-    client, model: str, rewrite_prompt: str,
-    question: str, options, reasoning: str, response: str, answer: str,
-    issues: dict, label: str, max_tokens: int
+async def rewrite_sample_async(
+    client, semaphore, model, rewrite_prompt,
+    question, options, reasoning, response, answer, issues, label, max_tokens
 ) -> dict | None:
     user_msg = build_rewrite_message(question, options, reasoning, response, answer, issues)
-    raw = call_api(client, model, rewrite_prompt, user_msg, max_tokens, label + "/rewrite")
+    raw = await call_api_async(
+        client, semaphore, model, rewrite_prompt, user_msg, max_tokens, label + "/rewrite"
+    )
     if raw is None:
         return None
-
     result = parse_rewrite_output(raw)
     if result is None:
         print(f"\n  [WARN] Rewrite delimiter not found for {label} | raw: {raw[:200]}")
         return None
-
     return {
         "reasoning": result["reasoning"] if result["reasoning"] else reasoning,
         "response":  result["response"]  if result["response"]  else response,
@@ -266,11 +231,12 @@ def rewrite_sample(
 
 # ── Per-sample processing ─────────────────────────────────────
 
-def process_sample(
-    client, model: str,
-    detect_prompt: str, rewrite_prompt: str,
-    sample: dict, meta_by_index: dict,
-    gen_config: dict,
+async def process_sample_async(
+    sample: dict,
+    client, semaphore, model,
+    detect_prompt, rewrite_prompt,
+    max_tokens, max_iterations,
+    meta_by_index: dict,
 ) -> dict | None:
     idx        = sample.get("_index", 0)
     subset     = sample.get("_subset", "unknown")
@@ -286,25 +252,17 @@ def process_sample(
     answer = meta.get("answer", "") or ""
 
     if not reasoning and not response:
-        print(f"  [SKIP] No reasoning/response for {label}")
         return None
 
-    # ── Step 1: Detect ────────────────────────────────────────
-    issues = detect_issues(
-        client, model, detect_prompt,
-        question, options, reasoning, response,
-        label, max_tokens=512
+    # Step 1: Initial detection
+    issues = await detect_issues_async(
+        client, semaphore, model, detect_prompt,
+        question, options, reasoning, response, label
     )
-
     if issues is None:
-        # Detection API call failed entirely — skip to allow resume later
         return None
 
-    any_issue = any(issues.values())
-
-    if not any_issue:
-        # Clean sample — save as-is, no rewrite needed
-        print(f"→ clean")
+    if not any(issues.values()):
         return {
             "_subset":            subset,
             "_index":             idx,
@@ -320,35 +278,39 @@ def process_sample(
             "response_modified":  False,
             "reasoning":          reasoning,
             "response":           response,
+            "pf_iterations":      0,
         }
 
-    # Print detected issues
-    flags = "".join(k.upper() for k, v in issues.items() if v)
-    print(f"→ issues [{flags}]", end=" ", flush=True)
+    # Iterative rewrite loop
+    cur_reasoning   = reasoning
+    cur_response    = response
+    final_issues    = issues
+    iterations_done = 0
 
-    # ── Step 2: Rewrite ───────────────────────────────────────
-    rewritten = rewrite_sample(
-        client, model, rewrite_prompt,
-        question, options, reasoning, response, answer,
-        issues, label, max_tokens=gen_config["max_tokens"]
-    )
+    for iteration in range(max_iterations):
+        rewritten = await rewrite_sample_async(
+            client, semaphore, model, rewrite_prompt,
+            question, options, cur_reasoning, cur_response,
+            answer, final_issues, f"{label}/iter{iteration+1}", max_tokens
+        )
+        if rewritten is None:
+            return None  # allow resume to retry
 
-    if rewritten is None:
-        # Rewrite failed — skip so resume can retry
-        print("→ REWRITE FAILED (will retry on resume)")
-        return None
+        cur_reasoning   = rewritten["reasoning"] or cur_reasoning
+        cur_response    = rewritten["response"]  or cur_response
+        iterations_done = iteration + 1
 
-    new_reasoning = rewritten["reasoning"]
-    new_response  = rewritten["response"]
-
-    reasoning_modified = (new_reasoning != reasoning)
-    response_modified  = (new_response  != response)
-
-    mod_flags = []
-    if reasoning_modified: mod_flags.append("R")
-    if response_modified:  mod_flags.append("P")
-    tag = f"[{'+'.join(mod_flags)}]" if mod_flags else "[no change]"
-    print(f"→ rewritten {tag}")
+        # Re-detect
+        re_issues = await detect_issues_async(
+            client, semaphore, model, detect_prompt,
+            question, options, cur_reasoning, cur_response,
+            f"{label}/recheck{iteration+1}"
+        )
+        if re_issues is None:
+            break
+        final_issues = re_issues
+        if not any(final_issues.values()):
+            break
 
     return {
         "_subset":            subset,
@@ -359,42 +321,19 @@ def process_sample(
         "answer":             answer,
         "source_run":         source_run,
         "detected_issues":    issues,
+        "final_issues":       final_issues,
         "reasoning_original": reasoning,
         "response_original":  response,
-        "reasoning_modified": reasoning_modified,
-        "response_modified":  response_modified,
-        "reasoning":          new_reasoning,
-        "response":           new_response,
+        "reasoning_modified": cur_reasoning != reasoning,
+        "response_modified":  cur_response  != response,
+        "reasoning":          cur_reasoning,
+        "response":           cur_response,
+        "pf_iterations":      iterations_done,
     }
 
 # ── Main ─────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="2-step post-filter: detect issues, then rewrite only flagged samples"
-    )
-    parser.add_argument("--api-key",        required=True)
-    parser.add_argument("--model",          required=True,
-                        help="OpenRouter model ID (e.g. deepseek/deepseek-v3.2)")
-    parser.add_argument("--input-dir",      required=True,
-                        help="Run directory with *_reasoning.json files")
-    parser.add_argument("--detect-prompt",  default=DETECT_PROMPT_DEFAULT)
-    parser.add_argument("--rewrite-prompt", default=REWRITE_PROMPT_DEFAULT)
-    parser.add_argument("--data-dir",       default=META_DIR)
-    parser.add_argument("--output-dir",     default=None,
-                        help="Output dir (default: post_filtering/post_filtering_YYYYMMDD_HHMMSS/)")
-    parser.add_argument("--subsets",        nargs="*", default=None)
-    parser.add_argument("--resume",         action="store_true")
-    parser.add_argument("--retry-index",    type=int, default=None,
-                        help="Re-process only this _index (requires --subsets)")
-    # Generation config for rewrite step
-    parser.add_argument("--temperature",    type=float, default=0)
-    parser.add_argument("--top-p",         type=float, default=0.9)
-    parser.add_argument("--max-tokens",    type=int,   default=131072,
-                        help="Max output tokens for rewrite step (default: 131072)")
-    args = parser.parse_args()
-
-    # Resolve paths
+async def async_main(args):
     input_dir = args.input_dir
     if not os.path.isabs(input_dir):
         input_dir = os.path.join(BASE_DIR, input_dir)
@@ -411,19 +350,20 @@ def main():
         args.output_dir = os.path.join(BASE_DIR, args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    gen_config = {"max_tokens": args.max_tokens}
-
     detect_prompt  = load_prompt(args.detect_prompt)
     rewrite_prompt = load_prompt(args.rewrite_prompt)
-    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=args.api_key)
+    client    = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=args.api_key)
+    semaphore = asyncio.Semaphore(args.workers)
 
     print(f"Source run    : {source_run}")
     print(f"Input  dir    : {input_dir}")
     print(f"Output dir    : {args.output_dir}")
     print(f"Model         : {args.model}")
+    print(f"Workers       : {args.workers}")
     print(f"Max tokens    : {args.max_tokens}")
+    print(f"Max iterations: {args.max_iterations}")
 
-    # Discover files
+    # Discover subset files
     if args.subsets:
         reason_files = [os.path.join(input_dir, f"{s}_reasoning.json") for s in args.subsets]
     else:
@@ -484,13 +424,15 @@ def main():
 
         output_path = os.path.join(args.output_dir, f"{subset_name}_reasoning.json")
 
-        # Auto-resume
+        # Resume: load already-done indices
         done_indices   = set()
-        subset_results = []
+        subset_results = {}
         if os.path.exists(output_path):
             with open(output_path, "r", encoding="utf-8") as f:
-                subset_results = json.load(f)
-            done_indices = {r.get("_index") for r in subset_results}
+                existing = json.load(f)
+            for r in existing:
+                subset_results[r["_index"]] = r
+            done_indices = set(subset_results.keys())
             if done_indices:
                 print(f"  [RESUME] Already done: {len(done_indices)} sample(s) — skipping")
 
@@ -501,75 +443,125 @@ def main():
                 print(f"  [ERROR] _index {args.retry_index} not found in {subset_name}.")
                 continue
             print(f"  [RETRY] _index={args.retry_index}", end=" ", flush=True)
-            result = process_sample(
-                client, args.model,
+            result = await process_sample_async(
+                target, client, semaphore, args.model,
                 detect_prompt, rewrite_prompt,
-                target, meta_by_index, gen_config
+                args.max_tokens, args.max_iterations, meta_by_index,
             )
             if result:
-                subset_results = [r for r in subset_results if r.get("_index") != args.retry_index]
-                subset_results.append(result)
-                subset_results.sort(key=lambda r: r.get("_index", 0))
-                with open(output_path, "w", encoding="utf-8") as f:
-                    json.dump(subset_results, f, ensure_ascii=False, indent=2)
+                subset_results[args.retry_index] = result
+                _flush_results(subset_results, output_path)
                 print(f"  Saved → {output_path}")
             overall["subsets"][subset_name] = len(subset_results)
             continue
 
-        # Normal loop
         pending = [s for s in samples if s.get("_index") not in done_indices]
         if not pending:
             print(f"  [SKIP] All samples already processed.")
             overall["subsets"][subset_name] = len(subset_results)
             continue
 
-        subset_clean    = 0
-        subset_rewritten = 0
-        subset_failed   = 0
+        # Async processing
+        lock     = asyncio.Lock()
+        stats    = {"clean": 0, "rewritten": 0, "failed": 0}
+        completed = 0
+        total_pending = len(pending)
 
-        for i, sample in enumerate(pending):
-            idx_label = sample.get("_index", i)
-            print(f"  [{i+1:>3}/{len(pending)}] {subset_name}_{idx_label}", end="  ", flush=True)
-
-            result = process_sample(
-                client, args.model,
+        async def process_one(sample: dict):
+            nonlocal completed
+            idx    = sample.get("_index", 0)
+            result = await process_sample_async(
+                sample, client, semaphore, args.model,
                 detect_prompt, rewrite_prompt,
-                sample, meta_by_index, gen_config
+                args.max_tokens, args.max_iterations, meta_by_index,
             )
+            async with lock:
+                completed += 1
+                if result is None:
+                    stats["failed"] += 1
+                    print(f"  [{completed:>3}/{total_pending}] {subset_name}_{idx}  → FAILED")
+                else:
+                    subset_results[idx] = result
+                    iters = result.get("pf_iterations", 0)
+                    if iters == 0:
+                        stats["clean"] += 1
+                        print(f"  [{completed:>3}/{total_pending}] {subset_name}_{idx}  → clean")
+                    else:
+                        stats["rewritten"] += 1
+                        mod = []
+                        if result.get("reasoning_modified"): mod.append("R")
+                        if result.get("response_modified"):  mod.append("P")
+                        tag = f"[{'+'.join(mod)}]" if mod else "[no change]"
+                        flags = "".join(
+                            k.upper() for k, v in result.get("detected_issues", {}).items() if v
+                        )
+                        print(
+                            f"  [{completed:>3}/{total_pending}] {subset_name}_{idx}"
+                            f"  → [{flags}] rewritten {tag} ({iters} iter(s))"
+                        )
+                    # Save after every completed sample
+                    _flush_results(subset_results, output_path)
 
-            if result is None:
-                subset_failed += 1
-                continue
+        await asyncio.gather(*[process_one(s) for s in pending])
 
-            if not any(result["detected_issues"].values()):
-                subset_clean += 1
-            else:
-                subset_rewritten += 1
-
-            subset_results.append(result)
-            subset_results.sort(key=lambda r: r.get("_index", 0))
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(subset_results, f, ensure_ascii=False, indent=2)
-
-        overall["stats"]["total"]     += len(pending)
-        overall["stats"]["clean"]     += subset_clean
-        overall["stats"]["rewritten"] += subset_rewritten
-        overall["stats"]["failed"]    += subset_failed
+        overall["stats"]["total"]     += total_pending
+        overall["stats"]["clean"]     += stats["clean"]
+        overall["stats"]["rewritten"] += stats["rewritten"]
+        overall["stats"]["failed"]    += stats["failed"]
         overall["subsets"][subset_name] = len(subset_results)
 
         print(
-            f"  → clean: {subset_clean} | rewritten: {subset_rewritten} | failed: {subset_failed}"
+            f"  → clean: {stats['clean']} | rewritten: {stats['rewritten']}"
+            f" | failed: {stats['failed']}"
         )
         print(f"  Saved → {output_path}")
 
     # Final summary
     s = overall["stats"]
     print(f"\n{'='*60}")
-    print(f"Done.  total={s['total']}  clean={s['clean']}  rewritten={s['rewritten']}  failed={s['failed']}")
+    print(
+        f"Done.  total={s['total']}  clean={s['clean']}"
+        f"  rewritten={s['rewritten']}  failed={s['failed']}"
+    )
     summary_path = os.path.join(args.output_dir, "post_filter_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(overall, f, ensure_ascii=False, indent=2)
     print(f"Summary → {summary_path}")
+
+
+def _flush_results(results: dict, path: str):
+    sorted_list = sorted(results.values(), key=lambda r: r.get("_index", 0))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(sorted_list, f, ensure_ascii=False, indent=2)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Async iterative post-filter: detect issues, rewrite, re-detect until clean"
+    )
+    parser.add_argument("--api-key",        required=True)
+    parser.add_argument("--model",          required=True,
+                        help="OpenRouter model ID (e.g. deepseek/deepseek-v3.2)")
+    parser.add_argument("--input-dir",      required=True,
+                        help="Run directory with *_reasoning.json files")
+    parser.add_argument("--detect-prompt",  default=DETECT_PROMPT_DEFAULT)
+    parser.add_argument("--rewrite-prompt", default=REWRITE_PROMPT_DEFAULT)
+    parser.add_argument("--data-dir",       default=META_DIR)
+    parser.add_argument("--output-dir",     default=None,
+                        help="Output dir (default: post_filtering/post_filtering_YYYYMMDD_HHMMSS/)")
+    parser.add_argument("--subsets",        nargs="*", default=None)
+    parser.add_argument("--resume",         action="store_true")
+    parser.add_argument("--retry-index",    type=int, default=None,
+                        help="Re-process only this _index (requires --subsets)")
+    parser.add_argument("--workers",        type=int, default=5,
+                        help="Max concurrent API calls (default: 5)")
+    parser.add_argument("--max-tokens",     type=int, default=131072,
+                        help="Max output tokens for rewrite step (default: 131072)")
+    parser.add_argument("--max-iterations", type=int, default=3,
+                        help="Max detect→rewrite iterations per sample (default: 3)")
+    args = parser.parse_args()
+
+    asyncio.run(async_main(args))
 
 
 if __name__ == "__main__":
