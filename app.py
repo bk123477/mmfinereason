@@ -23,6 +23,30 @@ ALL_REASON_DIRS = [
 
 # ── Helpers ────────────────────────────────────────────────
 
+def to_image_rel(image_path: str) -> str:
+    """Convert an absolute or relative image_path to a path relative to IMAGE_BASE.
+
+    Works on any machine regardless of the absolute prefix stored in the JSON,
+    by extracting the portion starting from 'mmfinereason_images/'.
+    """
+    if not image_path:
+        return ""
+    # Already relative
+    if not os.path.isabs(image_path):
+        return image_path
+    # Extract the relative portion after the image root folder name
+    marker = "mmfinereason_images" + os.sep
+    idx = image_path.find(marker)
+    if idx != -1:
+        return image_path[idx + len(marker):]
+    # Fallback: try relpath if file happens to exist locally
+    if os.path.exists(image_path):
+        try:
+            return os.path.relpath(image_path, IMAGE_BASE)
+        except ValueError:
+            pass
+    return ""
+
 def list_runs():
     """Return sorted list of timestamped run-folder names, newest first.
     Scans all reasoning variant directories."""
@@ -43,12 +67,7 @@ def build_entry(r_item, meta_by_index):
     meta_item = meta_by_index.get(idx, {})
 
     image_abs = r_item.get("image_path") or meta_item.get("_image_path") or ""
-    image_rel = ""
-    if image_abs and os.path.exists(image_abs):
-        try:
-            image_rel = os.path.relpath(image_abs, IMAGE_BASE)
-        except ValueError:
-            image_rel = ""
+    image_rel = to_image_rel(image_abs)
 
     return {
         "index":         idx,
@@ -239,12 +258,7 @@ def load_postfilter_run(run_name):
         processed = []
         for item in entries:
             image_abs = item.get("image_path", "") or ""
-            image_rel = ""
-            if image_abs and os.path.exists(image_abs):
-                try:
-                    image_rel = os.path.relpath(image_abs, IMAGE_BASE)
-                except ValueError:
-                    image_rel = ""
+            image_rel = to_image_rel(image_abs)
 
             processed.append({
                 "index":              item.get("_index", 0),
