@@ -31,18 +31,20 @@ def to_image_rel(image_path: str) -> str:
     """
     if not image_path:
         return ""
+    # Normalize to forward slashes for URL compatibility (works on both Windows and Mac)
+    image_path_norm = image_path.replace("\\", "/")
     # Already relative
     if not os.path.isabs(image_path):
-        return image_path
+        return image_path_norm
     # Extract the relative portion after the image root folder name
-    marker = "mmfinereason_images" + os.sep
-    idx = image_path.find(marker)
+    marker = "mmfinereason_images/"
+    idx = image_path_norm.find(marker)
     if idx != -1:
-        return image_path[idx + len(marker):]
+        return image_path_norm[idx + len(marker):]
     # Fallback: try relpath if file happens to exist locally
     if os.path.exists(image_path):
         try:
-            return os.path.relpath(image_path, IMAGE_BASE)
+            return os.path.relpath(image_path, IMAGE_BASE).replace("\\", "/")
         except ValueError:
             pass
     return ""
