@@ -2,33 +2,12 @@
   "source_run": "reasoning_think_20260406_215604",
   "model": "deepseek/deepseek-v3.2",
   "subsets": {
-    "BMMR": 10,
-    "Euclid30K": 10,
-    "FineVision-ai2d_merged": 10,
-    "FineVision-geo170k(qa)": 10,
-    "FineVision-geometry3k(mathv360k)": 10,
-    "FineVision-raven": 10,
-    "FineVision-scienceqa": 10,
-    "FineVision-tqa": 10,
-    "FineVision-visualwebinstruct(filtered)": 9,
-    "GameQA-140K": 7,
-    "LLaVA-CoT": 9,
-    "MMK12": 10,
-    "MMR1": 10,
-    "PuzzleQA": 10,
-    "ViRL39K": 10,
-    "VisualSphinx": 10,
-    "WaltonColdStart": 10,
-    "WeMath2-Pro": 10,
-    "WeMath2-SFT": 10,
-    "WeMath2-Standard": 10,
-    "Zebra-CoT-Physics": 10,
-    "mmopenr1-8k": 10
+    "FineVision-visualwebinstruct(filtered)": 10
   },
   "stats": {
-    "total": 220,
-    "clean": 93,
-    "rewritten": 122,
-    "failed": 5
+    "total": 0,
+    "clean": 0,
+    "rewritten": 0,
+    "failed": 0
   }
 }
