@@ -26,23 +26,24 @@ Content continues...
 
 **Best for:** Complex multi-step problems that require systematic, phase-by-phase analysis.
 Math word problems, multi-condition geometry, science problems with multiple unknowns.
+Use this as the **default** structure when no other workflow fits more naturally.
 
 **Sections:**
 ```
 [Problem Understanding]
-[Visual Survey]
+[Visual Analysis]
 [Information Extraction]
-[Solution Planning]
+[Solution Strategy]
 [Step-by-Step Execution]
-[Answer & Verification]
+[Verification & Answer]
 ```
 
-[Problem Understanding]: State what the question is asking. Identify the problem type, what is given, and what needs to be found.
-[Visual Survey]: Systematically scan the image. Identify all visible elements, labels, measurements, and spatial arrangements.
-[Information Extraction]: List all relevant values, formulas, constraints, and relationships extracted from the image and question.
-[Solution Planning]: Decide the approach — which formulas, theorems, or reasoning steps to apply, and in what order.
-[Step-by-Step Execution]: Carry out the solution plan with explicit calculations or logical deductions at each step.
-[Answer & Verification]: State the final answer. Cross-check it against the image and question for consistency.
+[Problem Understanding]: State precisely what the question is asking. Identify the problem type, what information is given, what constraints exist, and what needs to be found.
+[Visual Analysis]: Systematically examine the image. Identify all visible elements, labels, measurements, spatial arrangements, and any information embedded in diagrams or figures.
+[Information Extraction]: List all relevant values, formulas, constraints, and relationships extracted from both the question text and the image. Retrieve any applicable domain knowledge, definitions, or theorems needed to solve the problem.
+[Solution Strategy]: Decide the overall approach — which formulas, theorems, or reasoning steps to apply, and in what order. Justify why this strategy is appropriate for the problem.
+[Step-by-Step Execution]: Carry out the solution plan with explicit calculations or logical deductions at each step. Show all intermediate work without skipping steps.
+[Verification & Answer]: Cross-check the result against the question and image for consistency. Confirm the answer satisfies all given conditions, then state it clearly and concisely.
 
 ---
 

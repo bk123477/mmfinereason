@@ -1,6 +1,6 @@
 import os
 import json
-from flask import Flask, render_template, jsonify, send_from_directory, abort
+from flask import Flask, render_template, jsonify, send_from_directory, abort, request
 
 app = Flask(__name__)
 
@@ -228,7 +228,7 @@ def list_postfilter_runs():
     runs = [
         d for d in os.listdir(POST_FILTERING_DIR)
         if os.path.isdir(os.path.join(POST_FILTERING_DIR, d))
-        and d.startswith("post_filtering_")
+        and (d.startswith("post_filtering_") or d.startswith("reconstruct_"))
     ]
     return sorted(runs, reverse=True)
 
@@ -240,15 +240,21 @@ def load_postfilter_run(run_name):
         return []
 
     subsets = []
-    reason_files = sorted(
+    json_files = sorted(
         f for f in os.listdir(run_dir)
-        if f.endswith("_reasoning.json")
-        and f not in ("reasoning_summary.json", "post_filter_summary.json")
+        if f.endswith(".json")
+        and f not in ("reasoning_summary.json", "post_filter_summary.json", "reconstruct_summary.json")
     )
 
-    for rf in reason_files:
-        subset_name = rf.replace("_reasoning.json", "")
-        file_path   = os.path.join(run_dir, rf)
+    for rf in json_files:
+        if rf.endswith("_reasoning.json"):
+            subset_name = rf.replace("_reasoning.json", "")
+        elif rf == "metadata_reconstruct.json":
+            subset_name = "metadata_reconstruct"
+        else:
+            subset_name = rf.replace(".json", "")
+
+        file_path = os.path.join(run_dir, rf)
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -259,15 +265,32 @@ def load_postfilter_run(run_name):
 
         processed = []
         for item in entries:
-            image_abs = item.get("image_path", "") or ""
+            if not isinstance(item, dict):
+                processed.append({
+                    "index": 0,
+                    "question": "",
+                    "options": None,
+                    "image_rel": "",
+                    "answer": "",
+                    "source_run": "",
+                    "reasoning_original": "",
+                    "response_original": "",
+                    "reasoning_modified": False,
+                    "response_modified": False,
+                    "reasoning": "",
+                    "response": str(item),
+                })
+                continue
+
+            image_abs = item.get("image_path", "") or item.get("_image_path", "") or ""
             image_rel = to_image_rel(image_abs)
 
             processed.append({
                 "index":              item.get("_index", 0),
-                "question":           item.get("question", ""),
+                "question":           item.get("question_clean", "") or item.get("question", ""),
                 "options":            item.get("options"),
                 "image_rel":          image_rel,
-                "answer":             item.get("answer", ""),
+                "answer":             item.get("answer", "") or item.get("original_answer", ""),
                 "source_run":         item.get("source_run", ""),
                 "reasoning_original": item.get("reasoning_original", ""),
                 "response_original":  item.get("response_original", ""),
@@ -354,6 +377,84 @@ def api_postfilter_stats(run_name):
         "min_response":  None, "max_response":  None,
     }
     return jsonify({"run": run_name, "subsets": rows, "total": total_row})
+
+
+# ── RC vs PF compare ──────────────────────────────────────────
+
+def _img_key(path: str) -> str:
+    """Normalize image path to relative key for cross-dataset matching."""
+    if not path:
+        return ""
+    path = path.replace("\\", "/")
+    marker = "mmfinereason_images/"
+    idx = path.find(marker)
+    return path[idx + len(marker):] if idx != -1 else os.path.basename(path)
+
+
+@app.route("/api/rc_vs_pf/runs")
+def api_rc_vs_pf_runs():
+    all_runs = list_postfilter_runs()
+    return jsonify({
+        "reconstruct": [r for r in all_runs if r.startswith("reconstruct_")],
+        "postfilter":  [r for r in all_runs if r.startswith("post_filtering_")],
+    })
+
+
+@app.route("/api/rc_vs_pf/samples")
+def api_rc_vs_pf_samples():
+    rc_run = request.args.get("rc_run", "")
+    pf_run = request.args.get("pf_run", "")
+
+    # Load reconstruct results
+    rc_path = os.path.join(POST_FILTERING_DIR, rc_run, "metadata_reconstruct.json")
+    if not os.path.exists(rc_path):
+        return jsonify([])
+    try:
+        with open(rc_path, "r", encoding="utf-8") as f:
+            rc_items = json.load(f)
+    except Exception:
+        return jsonify([])
+
+    # Load postfilter results, index by normalized image path
+    pf_by_img = {}
+    pf_dir = os.path.join(POST_FILTERING_DIR, pf_run)
+    if os.path.isdir(pf_dir):
+        skip = {"reconstruct_summary.json", "post_filter_summary.json", "reasoning_summary.json"}
+        for fname in os.listdir(pf_dir):
+            if not fname.endswith(".json") or fname in skip:
+                continue
+            try:
+                with open(os.path.join(pf_dir, fname), "r", encoding="utf-8") as f:
+                    items = json.load(f)
+                if isinstance(items, list):
+                    for item in items:
+                        key = _img_key(item.get("_image_path") or item.get("image_path") or "")
+                        if key:
+                            pf_by_img[key] = item
+            except Exception:
+                continue
+
+    # Match reconstruct → postfilter by image key
+    pairs = []
+    for rc in rc_items:
+        key = _img_key(rc.get("_image_path", ""))
+        pf  = pf_by_img.get(key, {})
+        pairs.append({
+            "image_rel":    to_image_rel(rc.get("_image_path", "")),
+            "question":     rc.get("question_clean") or rc.get("question", ""),
+            "answer":       rc.get("answer", ""),
+            "_subset":      rc.get("_subset", ""),
+            "_index":       rc.get("_index", 0),
+            "rc_reasoning": rc.get("reasoning", ""),
+            "rc_response":  rc.get("response", ""),
+            "rc_workflow":  rc.get("rc_workflow", ""),
+            "pf_reasoning": pf.get("reasoning", ""),
+            "pf_response":  pf.get("response", ""),
+            "pf_flags":     pf.get("_pf_flags", ""),
+            "pf_found":     bool(pf),
+        })
+
+    return jsonify(pairs)
 
 
 if __name__ == "__main__":
