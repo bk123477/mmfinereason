@@ -39,12 +39,15 @@ All original content is preserved — no summarization or omission.
 ---
 
 ## Quick Start
+conda activate skt
+
 
 ```bash
 # Single parquet, part 0 of 4
-python sft_reconstruct.py \
+python src/sft_reconstruct/sft_reconstruct.py \
   --model deepseek/deepseek-v3.2 \
-  --parquet /path/to/train-00000-of-00070.parquet \
+  --parquet /Users/hongminki/Downloads/SKT/mmfinereason/dataset/raw/MMFineReason-SFT-586K-Qwen3-VL-235B-Thinking/data/train-00001-of-00070.parquet \
+  --workers 20 \
   --part 0
 
 # Run all 4 parts in parallel across 4 terminals
@@ -113,6 +116,14 @@ dataset/
   "question_clean": "...",        // <image> tag removed
   "options": ["A", "B", "C", "D"],
   "answer": "B",
+  "image_info": {                 // image metadata from parquet
+    "width": 800,
+    "height": 600,
+    "mode": "RGB",
+    "format": "JPEG",
+    "path": "image.jpg"           // original filename if stored in parquet
+  },
+  "image_b64": "...",             // base64-encoded raw image bytes (for post-processing)
   "reasoning_original": "...",    // original <think> block
   "response_original": "...",     // original text after </think>
   "reasoning": "...",             // restructured reasoning
@@ -120,6 +131,9 @@ dataset/
   "rc_workflow": "Structured Decomposition (SD)"
 }
 ```
+
+`image_info` and `image_b64` are `null` if the parquet row has no image.
+`image_b64` contains the raw image bytes as base64 — decode and write to disk during post-processing to obtain the original image file.
 
 ### Error log (`_errors.json`)
 

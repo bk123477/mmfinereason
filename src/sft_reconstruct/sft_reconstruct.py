@@ -18,8 +18,10 @@ Usage:
 import os
 import re
 import json
+import base64
 import asyncio
 import argparse
+from io import BytesIO
 from datetime import datetime
 
 import pandas as pd
@@ -105,21 +107,121 @@ def extract_response_block(text: str) -> str:
 
 
 def parse_reconstruct_output(raw: str) -> dict | None:
-    """Extract <WORKFLOW>, <REASONING>, <RESPONSE> from LLM output."""
+    """Extract <WORKFLOW> and <REASONING>; parse everything after </REASONING> as response."""
     r_m  = re.search(r"<REASONING>(.*?)</REASONING>", raw, re.DOTALL)
-    p_m  = re.search(r"<RESPONSE>(.*?)</RESPONSE>",   raw, re.DOTALL)
     wf_m = re.search(r"<WORKFLOW>(.*?)</WORKFLOW>",    raw, re.DOTALL)
-    if not r_m and not p_m:
+    if not r_m and not wf_m:
         return None
+    response = None
+    if r_m:
+        response = raw[r_m.end():].strip()
     return {
         "reasoning": r_m.group(1).strip()  if r_m  else None,
-        "response":  p_m.group(1).strip()  if p_m  else None,
+        "response":  response,
         "workflow":  wf_m.group(1).strip() if wf_m else None,
     }
 
 
+def response_has_phase_leakage(text: str) -> bool:
+    """Detect templated phase-style leakage inside the response."""
+    if not text:
+        return False
+    return any([
+        re.search(r"(?im)^\s*#{2,}\s*phase\b", text) is not None,
+        re.search(r"(?im)\bphase\s*\d+\b", text) is not None,
+        re.search(r"(?m)^\[[^\n\]]+\]\s*$", text) is not None,
+    ])
+
+
+def reconstruct_output_is_valid(parsed: dict | None) -> bool:
+    """Require both reasoning and response, with response free of phase leakage."""
+    return len(get_reconstruct_output_issues(parsed)) == 0
+
+
+def get_reconstruct_output_issues(parsed: dict | None) -> list[str]:
+    """Return structured validation issues for parsed reconstruct output."""
+    issues = []
+    if not parsed:
+        return ["parse_failure"]
+
+    reasoning = (parsed.get("reasoning") or "").strip()
+    response = (parsed.get("response") or "").strip()
+
+    if not reasoning:
+        issues.append("reasoning_empty")
+    if not response:
+        issues.append("response_empty")
+    elif response_has_phase_leakage(response):
+        issues.append("response_phase_leakage")
+
+    return issues
+
+
+def extract_image_info(img_val) -> tuple[dict | None, str | None]:
+    """
+    Extract image metadata and base64-encoded bytes from a parquet image value.
+    Returns (image_info dict, image_b64 string).
+    Supports HuggingFace dict format, PIL Image, and raw bytes.
+    """
+    if img_val is None:
+        return None, None
+    try:
+        from PIL import Image as PILImage
+
+        if isinstance(img_val, dict):
+            # HuggingFace datasets format: {'bytes': b'...', 'path': '...'}
+            raw_bytes = img_val.get("bytes")
+            img_path  = img_val.get("path")
+            if raw_bytes:
+                img = PILImage.open(BytesIO(raw_bytes))
+                return (
+                    {
+                        "width":  img.width,
+                        "height": img.height,
+                        "mode":   img.mode,
+                        "format": img.format or "unknown",
+                        "path":   img_path,
+                    },
+                    base64.b64encode(raw_bytes).decode("utf-8"),
+                )
+
+        elif hasattr(img_val, "save"):  # PIL Image object
+            fmt = img_val.format or "PNG"
+            buf = BytesIO()
+            img_val.save(buf, format=fmt)
+            raw_bytes = buf.getvalue()
+            return (
+                {
+                    "width":  img_val.width,
+                    "height": img_val.height,
+                    "mode":   img_val.mode,
+                    "format": fmt,
+                    "path":   None,
+                },
+                base64.b64encode(raw_bytes).decode("utf-8"),
+            )
+
+        elif isinstance(img_val, (bytes, bytearray)):
+            img = PILImage.open(BytesIO(img_val))
+            return (
+                {
+                    "width":  img.width,
+                    "height": img.height,
+                    "mode":   img.mode,
+                    "format": img.format or "unknown",
+                    "path":   None,
+                },
+                base64.b64encode(bytes(img_val)).decode("utf-8"),
+            )
+
+    except Exception as e:
+        return {"error": str(e)}, None
+
+    return None, None
+
+
 def row_to_sample(row: dict, row_idx: int) -> dict:
-    """Convert a parquet row to a sample dict (no image field)."""
+    """Convert a parquet row to a sample dict (includes image metadata and base64 bytes)."""
     question = str(row.get("question", "") or "").replace("<image>", "").strip()
     source   = str(row.get("source", "unknown") or "unknown")
 
@@ -137,10 +239,16 @@ def row_to_sample(row: dict, row_idx: int) -> dict:
             sample[col] = val
 
     sample["question_clean"] = question
+
+    # Save image info and base64 bytes for downstream post-processing
+    image_info, image_b64 = extract_image_info(row.get("image"))
+    sample["image_info"] = image_info
+    sample["image_b64"]  = image_b64
+
     return sample
 
 
-def build_reconstruct_message(question: str, options, qwen_thinking: str, qwen_response: str) -> str:
+def build_reconstruct_message(question: str, options, qwen_thinking: str) -> str:
     """Build the user message for the reconstruction API call."""
     options_str = ""
     if options:
@@ -156,20 +264,37 @@ def build_reconstruct_message(question: str, options, qwen_thinking: str, qwen_r
         f"### Question:\n{question}{options_str}\n\n"
         f"---\n\n"
         f"### Existing Reasoning:\n{qwen_thinking or '(empty)'}\n\n"
-        f"### Existing Response:\n{qwen_response or '(empty)'}\n\n"
         f"---\n\n"
-        f"Select the most appropriate workflow for this problem, then restructure "
-        f"the reasoning and response accordingly. "
-        f"When reconstructing the reasoning, use BOTH the existing reasoning and the existing response as source material, "
-        f"and preserve all substantive problem-solving content in full — do not summarize or omit steps. "
-        f"Preserve the model's deliberation process: keep wait/check/rethink moments, backtracking, alternate hypotheses, "
-        f"and self-corrections when they appear in the original. "
-        f"Do not over-clean the reasoning into a polished final proof; keep the original exploratory texture inside the workflow sections. "
-        f"When reconstructing the response, do NOT return a bare answer only. "
-        f"Write a compact solution-style explanation that reflects the key observations and logic, "
-        f"using the existing response as a seed and enriching it with the preserved reasoning content when needed. "
-        f"The response should feel like a short explanation of the solution, not just the final answer. "
-        f"Return the complete output in the specified XML format."
+        f"Select the most appropriate workflow and restructure the reasoning and response. "
+        f"Follow all rules in the system prompt exactly.\n\n"
+        f"CONTENT REQUIREMENTS:\n"
+        f"- This is reconstruction, not summarization.\n"
+        f"- Preserve the full reasoning content in workflow-shaped form.\n"
+        f"- Keep all substantial calculation steps, detours, option checks, self-corrections, and verification steps.\n"
+        f"- If the original reasoning explored multiple attempts, the reconstructed reasoning must still include those attempts rather than collapsing them into one short solution.\n\n"
+        f"FORMAT REQUIREMENTS:\n"
+        f"- Output exactly one <WORKFLOW> block and one <REASONING> block.\n"
+        f"- <REASONING> must be non-empty.\n"
+        f"- After </REASONING>, continue with a non-empty final response in plain explanatory prose.\n"
+        f"- Do not stop after </REASONING>.\n"
+        f"- In the final response text after </REASONING>, do not use Phase, Step, bracketed subtitles, bullet lists, or workflow labels.\n"
+    )
+
+
+def build_response_retry_message(question: str, options, qwen_thinking: str) -> str:
+    """Retry message used only when the response leaks phase/template structure."""
+    base = build_reconstruct_message(question, options, qwen_thinking)
+    return (
+        base
+        + "\n\nIMPORTANT CORRECTION FOR RETRY:\n"
+        + "- The previous final response was malformed or missing.\n"
+        + "- Rewrite both the reasoning and the final response so the output fully matches the required format.\n"
+        + "- Do not shorten the reasoning into a summary.\n"
+        + "- Preserve the full chain of reasoning in workflow-shaped form.\n"
+        + "- After </REASONING>, write a non-empty plain-prose final response.\n"
+        + "- Do not use 'Phase', 'Step', bracketed subtitles, bullet lists, or workflow labels in the final response.\n"
+        + "- Make sure the final output still contains exactly one <WORKFLOW> block and one <REASONING> block.\n"
+        + "- Keep the response explanatory and complete, but natural.\n"
     )
 
 
@@ -200,7 +325,7 @@ def clear_error(errors: dict, index: int):
 
 
 def append_summary(path: str, run_info: dict):
-    """Append a run record to the summary file — never overwrites existing runs."""
+    """Append a run record and refresh cumulative totals."""
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -209,7 +334,29 @@ def append_summary(path: str, run_info: dict):
             data = {"runs": []}
     else:
         data = {"runs": []}
-    data["runs"].append(run_info)
+    runs = data.get("runs", [])
+    runs.append(run_info)
+    data["runs"] = runs
+
+    total_prompt = sum((r.get("tokens") or {}).get("prompt", 0) for r in runs)
+    total_completion = sum((r.get("tokens") or {}).get("completion", 0) for r in runs)
+    total_tokens = sum((r.get("tokens") or {}).get("total", 0) for r in runs)
+    total_estimated_cost = sum(r.get("estimated_cost_usd", 0.0) or 0.0 for r in runs)
+    total_processed = sum(r.get("processed", 0) for r in runs)
+    total_errors = sum(r.get("errors", 0) for r in runs)
+
+    data["aggregate"] = {
+        "run_count": len(runs),
+        "processed": total_processed,
+        "errors": total_errors,
+        "tokens": {
+            "prompt": total_prompt,
+            "completion": total_completion,
+            "total": total_tokens,
+        },
+        "estimated_cost_usd": round(total_estimated_cost, 6),
+    }
+
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -248,7 +395,8 @@ async def call_api_async(
                     print(f"\n  [RATE LIMIT] {label} — waiting {wait}s (attempt {attempt+1}/{MAX_RETRIES})...")
                     await asyncio.sleep(wait)
                 else:
-                    print(f"\n  [API ERROR] {label}: {e}")
+                    err_type = "api_rate_limit" if is_rate else "api_error"
+                    print(f"\n  [API ERROR] {label} | type={err_type}: {e}")
                     return None
     return None
 
@@ -264,7 +412,7 @@ async def process_sample_async(
     reconstruct_prompt: str,
     max_tokens: int,
     counter: TokenCounter,
-) -> dict | None:
+) -> tuple[dict | None, str | None]:
     sample   = row_to_sample(row, row_idx)
     label    = f"{sample['_subset']}_{row_idx}"
     question = sample["question_clean"]
@@ -276,32 +424,56 @@ async def process_sample_async(
 
     if not qwen_thinking:
         print(f"  [SKIP] {label}: empty thinking block")
-        return None
+        return None, "reasoning_source_empty"
 
-    user_msg = build_reconstruct_message(question, options, qwen_thinking, qwen_response)
+    user_msg = build_reconstruct_message(question, options, qwen_thinking)
     raw = await call_api_async(
         client, semaphore, model, reconstruct_prompt, user_msg, max_tokens, label, counter
     )
     if raw is None:
-        return None
+        return None, "api_failure"
 
     parsed = parse_reconstruct_output(raw)
-    if parsed is None:
-        print(f"\n  [WARN] XML delimiter not found for {label} | raw: {raw[:200]}")
-        return None
+    issues = get_reconstruct_output_issues(parsed)
+    if issues:
+        retry_msg = build_response_retry_message(question, options, qwen_thinking)
+        retry_raw = await call_api_async(
+            client,
+            semaphore,
+            model,
+            reconstruct_prompt,
+            retry_msg,
+            max_tokens,
+            f"{label}:response-retry",
+            counter,
+        )
+        if retry_raw is not None:
+            retry_parsed = parse_reconstruct_output(retry_raw)
+            retry_issues = get_reconstruct_output_issues(retry_parsed)
+            if not retry_issues:
+                parsed = retry_parsed
+                issues = []
+
+    if issues:
+        raw_preview = (raw or "")[:200]
+        print(
+            f"\n  [WARN] Invalid reconstruct output for {label}"
+            f" | issues={','.join(issues)} | raw: {raw_preview}"
+        )
+        return None, ",".join(issues)
 
     wf = parsed.get("workflow")
     if wf:
         print(f"\n  [WF] {label} → {wf}", flush=True)
 
-    return {
+    return ({
         **sample,
         "reasoning_original": qwen_thinking,
         "response_original":  qwen_response,
-        "reasoning":          parsed["reasoning"] or qwen_thinking,
-        "response":           parsed["response"]  or qwen_response,
+        "reasoning":          parsed["reasoning"],
+        "response":           parsed["response"],
         "rc_workflow":        wf,
-    }
+    }, None)
 
 
 # ── Save ──────────────────────────────────────────────────────
@@ -396,7 +568,7 @@ async def async_main(args):
             return
         print(f"[RETRY] Re-generating index={args.retry_index}")
         row = df.iloc[args.retry_index].to_dict()
-        result = await process_sample_async(
+        result, failure_reason = await process_sample_async(
             row, args.retry_index, client, semaphore, args.model,
             reconstruct_prompt, args.max_tokens, counter
         )
@@ -405,7 +577,7 @@ async def async_main(args):
             clear_error(errors, args.retry_index)
             status = "OK"
         else:
-            log_error(errors, args.retry_index, "api_or_parse_failure")
+            log_error(errors, args.retry_index, failure_reason or "reconstruct_generation_failed")
             status = "ERR"
         await save_results(results, output_path, lock)
         save_error_log(errors, error_path)
@@ -437,7 +609,7 @@ async def async_main(args):
               f"{error_indices[:10]}{'...' if len(error_indices) > 10 else ''}")
         for row_idx in error_indices:
             row = df.iloc[row_idx].to_dict()
-            result = await process_sample_async(
+            result, failure_reason = await process_sample_async(
                 row, row_idx, client, semaphore, args.model,
                 reconstruct_prompt, args.max_tokens, counter
             )
@@ -446,8 +618,8 @@ async def async_main(args):
                 clear_error(errors, row_idx)
                 print(f"  idx={row_idx} → OK ({result.get('rc_workflow', '?')})")
             else:
-                log_error(errors, row_idx, "api_or_parse_failure")
-                print(f"  idx={row_idx} → ERR (still failing)")
+                log_error(errors, row_idx, failure_reason or "reconstruct_generation_failed")
+                print(f"  idx={row_idx} → ERR ({failure_reason or 'reconstruct_generation_failed'})")
         await save_results(results, output_path, lock)
         save_error_log(errors, error_path)
         append_summary(summary_path, {
@@ -480,7 +652,7 @@ async def async_main(args):
     async def process_one(row_idx: int):
         nonlocal completed
         row    = df.iloc[row_idx].to_dict()
-        result = await process_sample_async(
+        result, failure_reason = await process_sample_async(
             row, row_idx, client, semaphore, args.model,
             reconstruct_prompt, args.max_tokens, counter
         )
@@ -496,9 +668,9 @@ async def async_main(args):
                     flush=True
                 )
             else:
-                log_error(errors, row_idx, "api_or_parse_failure")
+                log_error(errors, row_idx, failure_reason or "reconstruct_generation_failed")
                 print(
-                    f"  [{completed:>5}/{total_pending}] idx={row_idx} → FAILED (logged)",
+                    f"  [{completed:>5}/{total_pending}] idx={row_idx} → FAILED ({failure_reason or 'reconstruct_generation_failed'})",
                     flush=True
                 )
 
