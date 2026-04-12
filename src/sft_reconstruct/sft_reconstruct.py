@@ -220,8 +220,13 @@ def extract_image_info(img_val) -> tuple[dict | None, str | None]:
     return None, None
 
 
-def row_to_sample(row: dict, row_idx: int) -> dict:
-    """Convert a parquet row to a sample dict (includes image metadata and base64 bytes)."""
+def row_to_sample(row: dict, row_idx: int, save_image: bool = False) -> dict:
+    """Convert a parquet row to a sample dict.
+
+    Args:
+        save_image: When True, include image_info (metadata) and image_b64 (base64 bytes)
+                    in the output. Default False — image fields are omitted entirely.
+    """
     question = str(row.get("question", "") or "").replace("<image>", "").strip()
     source   = str(row.get("source", "unknown") or "unknown")
 
@@ -240,10 +245,10 @@ def row_to_sample(row: dict, row_idx: int) -> dict:
 
     sample["question_clean"] = question
 
-    # Save image info and base64 bytes for downstream post-processing
-    image_info, image_b64 = extract_image_info(row.get("image"))
-    sample["image_info"] = image_info
-    sample["image_b64"]  = image_b64
+    if save_image:
+        image_info, image_b64 = extract_image_info(row.get("image"))
+        sample["image_info"] = image_info
+        sample["image_b64"]  = image_b64
 
     return sample
 
@@ -412,8 +417,9 @@ async def process_sample_async(
     reconstruct_prompt: str,
     max_tokens: int,
     counter: TokenCounter,
+    save_image: bool = False,
 ) -> tuple[dict | None, str | None]:
-    sample   = row_to_sample(row, row_idx)
+    sample   = row_to_sample(row, row_idx, save_image=save_image)
     label    = f"{sample['_subset']}_{row_idx}"
     question = sample["question_clean"]
     options  = sample.get("options")
@@ -570,7 +576,8 @@ async def async_main(args):
         row = df.iloc[args.retry_index].to_dict()
         result, failure_reason = await process_sample_async(
             row, args.retry_index, client, semaphore, args.model,
-            reconstruct_prompt, args.max_tokens, counter
+            reconstruct_prompt, args.max_tokens, counter,
+            save_image=args.save_image,
         )
         if result:
             results[args.retry_index] = result
@@ -611,7 +618,8 @@ async def async_main(args):
             row = df.iloc[row_idx].to_dict()
             result, failure_reason = await process_sample_async(
                 row, row_idx, client, semaphore, args.model,
-                reconstruct_prompt, args.max_tokens, counter
+                reconstruct_prompt, args.max_tokens, counter,
+                save_image=args.save_image,
             )
             if result:
                 results[row_idx] = result
@@ -654,7 +662,8 @@ async def async_main(args):
         row    = df.iloc[row_idx].to_dict()
         result, failure_reason = await process_sample_async(
             row, row_idx, client, semaphore, args.model,
-            reconstruct_prompt, args.max_tokens, counter
+            reconstruct_prompt, args.max_tokens, counter,
+            save_image=args.save_image,
         )
         async with lock:
             completed += 1
@@ -744,6 +753,9 @@ def main():
                         help="Save results every N completions (default: 20)")
     parser.add_argument("--max-tokens",  type=int, default=131072,
                         help="Max tokens for reconstruction (default: 131072)")
+    parser.add_argument("--save-image", action="store_true", default=False,
+                        help="Include image_info and image_b64 (base64 bytes) in output JSON. "
+                             "Default: off (image fields are omitted).")
     # Cost tracking
     parser.add_argument("--price-input",  type=float, default=0.26,
                         help="Input token price per 1M tokens in USD (default: 0.26)")
