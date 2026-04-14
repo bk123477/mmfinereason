@@ -1,39 +1,35 @@
 #!/bin/bash
 # ==============================================================
-#  run_part.sh — Run one part sequentially across all parquets
+#  run_2step_part.sh — Run one part sequentially across all parquets
+#                      for the VLM -> LLM 2-step pipeline
 #
 #  Usage:
-#    bash scripts/run_part.sh <part>
+#    bash scripts/run_2step_part.sh <part>
 #
-#  Example (open 4 terminals, one per part):
-#    bash scripts/run_part.sh 0
-#    bash scripts/run_part.sh 1
-#    bash scripts/run_part.sh 2
-#    bash scripts/run_part.sh 3
-#
-#  Each terminal handles one part and advances to the next parquet
-#  automatically when the current one finishes.
+#  Example:
+#    bash scripts/run_2step_part.sh 0
+#    bash scripts/run_2step_part.sh 1
+#    bash scripts/run_2step_part.sh 2
+#    bash scripts/run_2step_part.sh 3
 # ==============================================================
 
-# ── Configuration — MODIFY THESE BEFORE RUNNING ──────────────
+# ── Configuration — UPDATE THESE FOR YOUR NEW DATASET ─────────
 
-DATASET_DIR="/Users/hongminki/Downloads/SKT/mmfinereason/dataset/raw/MMFineReason-SFT-586K-Qwen3-VL-235B-Thinking/data"
+DATASET_DIR="/Users/hongminki/Downloads/SKT/mmfinereason/dataset/raw/MMFineReason-SFT-123K/data"
 PROMPTS_DIR="/Users/hongminki/Downloads/SKT/mmfinereason/prompts"
-PYTHON_SCRIPT="/Users/hongminki/Downloads/SKT/mmfinereason/src/sft_reconstruct/sft_reconstruct.py"
-OUTPUT_DIR="/Users/hongminki/Downloads/SKT/mmfinereason/dataset/reconstructed"
+PYTHON_SCRIPT="/Users/hongminki/Downloads/SKT/mmfinereason/src/sft_run/sft_2step_pipeline.py"
+OUTPUT_DIR="/Users/hongminki/Downloads/SKT/mmfinereason/dataset/two_step_pipeline_123k"
 
-MODEL="deepseek/deepseek-v3.2"
-WORKERS=100
+VLM_MODEL="qwen/qwen3.5-397b-a17b"
+LLM_MODEL="deepseek/deepseek-v3.2"
+WORKERS=8
 NUM_PARTS=4
 
-# Parquet range (inclusive on both ends, zero-padded 5-digit indices)
-START_IDX=2     # start from 00002 (0-based)
-END_IDX=69      # last parquet index (00069)
+# Inclusive parquet index range inside DATASET_DIR
+START_IDX=0
+END_IDX=69
 
-# Set to "--save-image" to include image_b64 in output, or leave empty
-SAVE_IMAGE_FLAG=""
-
-# ==============================================================
+# ──────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
@@ -49,7 +45,6 @@ if ! [[ "${PART}" =~ ^[0-9]+$ ]] || [[ "${PART}" -ge "${NUM_PARTS}" ]]; then
     exit 1
 fi
 
-# Collect parquet files sorted alphabetically (bash 3.2 compatible)
 PARQUETS=( $(ls "${DATASET_DIR}"/*.parquet 2>/dev/null | sort) )
 N_TOTAL=${#PARQUETS[@]}
 
@@ -59,12 +54,14 @@ if [[ ${N_TOTAL} -eq 0 ]]; then
 fi
 
 echo "============================================================"
+echo "Pipeline  : 2-step (VLM -> LLM)"
 echo "Part      : ${PART} / $(( NUM_PARTS - 1 ))"
 echo "Range     : ${START_IDX} → ${END_IDX}  (total parquets found: ${N_TOTAL})"
-echo "Model     : ${MODEL}"
+echo "VLM Model : ${VLM_MODEL}"
+echo "LLM Model : ${LLM_MODEL}"
 echo "Workers   : ${WORKERS}"
+echo "Input     : ${DATASET_DIR}"
 echo "Output    : ${OUTPUT_DIR}"
-echo "Save image: ${SAVE_IMAGE_FLAG:-no}"
 echo "============================================================"
 
 for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
@@ -83,15 +80,16 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     echo "------------------------------------------------------------"
 
     python "${PYTHON_SCRIPT}" \
-        --model              "${MODEL}" \
+        --vlm-model          "${VLM_MODEL}" \
+        --llm-model          "${LLM_MODEL}" \
         --parquet            "${PARQUET}" \
+        --template-path      "${PROMPTS_DIR}/reasoning_distillation.md" \
         --reconstruct-prompt "${PROMPTS_DIR}/reconstruct_prompt.md" \
         --workflows          "${PROMPTS_DIR}/reasoning_workflows.md" \
         --output-dir         "${OUTPUT_DIR}" \
         --workers            "${WORKERS}" \
         --num-parts          "${NUM_PARTS}" \
-        --part               "${PART}" \
-        ${SAVE_IMAGE_FLAG}
+        --part               "${PART}"
 
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] parquet ${idx} part ${PART} done."
 done

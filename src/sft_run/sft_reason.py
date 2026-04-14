@@ -41,6 +41,19 @@ OUTPUT_DIR_DEFAULT = os.path.join(BASE_DIR, "dataset", "reasoning")
 MAX_RETRIES  = 5
 RETRY_DELAYS = [10, 30, 60, 120, 180]
 
+MODEL_PRICING_USD_PER_MTOK = {
+    "qwen/qwen3.5-397b-a17b": {
+        "input": 0.39,
+        "output": 2.34,
+        "source": "https://openrouter.ai/qwen/qwen3.5-397b-a17b",
+    },
+    "deepseek/deepseek-v3.2": {
+        "input": 0.26,
+        "output": 0.38,
+        "source": "https://openrouter.ai/deepseek/deepseek-v3.2",
+    },
+}
+
 # ── Helpers ───────────────────────────────────────────────────
 
 def load_template(path: str) -> str:
@@ -171,6 +184,74 @@ def row_to_sample(row, row_idx: int) -> dict:
     )
     return sample
 
+
+def empty_usage_stats() -> dict:
+    return {
+        "requests": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+
+
+def extract_usage(resp) -> dict:
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return empty_usage_stats()
+
+    def _read(obj, key: str) -> int:
+        if obj is None:
+            return 0
+        if isinstance(obj, dict):
+            return int(obj.get(key, 0) or 0)
+        return int(getattr(obj, key, 0) or 0)
+
+    prompt_tokens = _read(usage, "prompt_tokens")
+    completion_tokens = _read(usage, "completion_tokens")
+    total_tokens = _read(usage, "total_tokens") or (prompt_tokens + completion_tokens)
+    return {
+        "requests": 1,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def merge_usage(stats: dict, delta: dict | None) -> dict:
+    if not delta:
+        return stats
+    for key in ("requests", "prompt_tokens", "completion_tokens", "total_tokens"):
+        stats[key] = int(stats.get(key, 0) or 0) + int(delta.get(key, 0) or 0)
+    return stats
+
+
+def estimate_cost_usd(model: str, usage_stats: dict) -> dict:
+    pricing = MODEL_PRICING_USD_PER_MTOK.get(model)
+    if not pricing:
+        return {
+            "model": model,
+            "pricing_found": False,
+            "input_cost_usd": None,
+            "output_cost_usd": None,
+            "total_cost_usd": None,
+            "pricing_source": None,
+        }
+
+    input_cost = usage_stats.get("prompt_tokens", 0) / 1_000_000 * pricing["input"]
+    output_cost = usage_stats.get("completion_tokens", 0) / 1_000_000 * pricing["output"]
+    return {
+        "model": model,
+        "pricing_found": True,
+        "input_cost_usd": round(input_cost, 6),
+        "output_cost_usd": round(output_cost, 6),
+        "total_cost_usd": round(input_cost + output_cost, 6),
+        "pricing_source": pricing["source"],
+        "pricing_usd_per_mtok": {
+            "input": pricing["input"],
+            "output": pricing["output"],
+        },
+    }
+
 # ── Async API call ────────────────────────────────────────────
 
 async def call_api_async(
@@ -180,8 +261,8 @@ async def call_api_async(
     content: list,
     gen_config: dict,
     label: str,
-) -> tuple[str | None, str | None]:
-    """Returns (reasoning, response) or (None, None) on failure."""
+) -> tuple[str | None, str | None, dict]:
+    """Returns (reasoning, response, usage) or (None, None, empty usage) on failure."""
     async with semaphore:
         for attempt in range(MAX_RETRIES):
             try:
@@ -201,7 +282,7 @@ async def call_api_async(
                     },
                 )
                 msg = resp.choices[0].message
-                return getattr(msg, "reasoning", None), msg.content
+                return getattr(msg, "reasoning", None), msg.content, extract_usage(resp)
 
             except Exception as e:
                 err = str(e)
@@ -212,8 +293,8 @@ async def call_api_async(
                     await asyncio.sleep(wait)
                 else:
                     print(f"\n  [ERROR] {label}: {e}")
-                    return None, None
-    return None, None
+                    return None, None, empty_usage_stats()
+    return None, None, empty_usage_stats()
 
 # ── Per-sample async processing ───────────────────────────────
 
@@ -226,7 +307,7 @@ async def process_sample_async(
     template: str,
     gen_config: dict,
     loop: asyncio.AbstractEventLoop,
-) -> dict:
+) -> tuple[dict, dict]:
     sample  = row_to_sample(row, row_idx)
     label   = f"{sample['_subset']}_{row_idx}"
     question = sample["question_clean"]
@@ -248,12 +329,12 @@ async def process_sample_async(
 
     content = build_user_content(template, question, options, base64_image, qwen_thinking, answer)
 
-    reasoning, response = await call_api_async(client, semaphore, model, content, gen_config, label)
+    reasoning, response, usage = await call_api_async(client, semaphore, model, content, gen_config, label)
 
     result = dict(sample)
     result["reasoning"] = reasoning
     result["response"]  = response
-    return result
+    return result, usage
 
 # ── Save helper ───────────────────────────────────────────────
 
@@ -392,6 +473,7 @@ async def async_main(args):
         "n":                  args.n,
         "max_tokens":         args.max_tokens,
     }
+    usage_stats = empty_usage_stats()
 
     # --retry-index: single sample
     if args.retry_index is not None:
@@ -400,9 +482,10 @@ async def async_main(args):
             return
         print(f"[RETRY] Re-generating index={args.retry_index}")
         row = df.iloc[args.retry_index].to_dict()
-        result = await process_sample_async(
+        result, usage = await process_sample_async(
             row, args.retry_index, client, semaphore, args.model, template, gen_config, loop
         )
+        merge_usage(usage_stats, usage)
         results[args.retry_index] = result
         if result.get("response"):
             clear_error(errors, args.retry_index)
@@ -412,6 +495,18 @@ async def async_main(args):
             status = "ERR"
         await save_results(results, output_path, lock)
         save_error_log(errors, error_path)
+        append_summary(summary_path, {
+            "start": run_start.isoformat(),
+            "end": datetime.now().isoformat(),
+            "model": args.model,
+            "range": [args.retry_index, args.retry_index + 1],
+            "processed": len(results),
+            "ok": 1 if result.get("response") else 0,
+            "errors": len(errors),
+            "mode": "retry-index",
+            "token_usage": usage_stats,
+            "cost_estimate": estimate_cost_usd(args.model, usage_stats),
+        })
         print(f"  → {status}  Saved → {output_path}")
         return
 
@@ -426,9 +521,10 @@ async def async_main(args):
               f"{error_indices[:10]}{'...' if len(error_indices) > 10 else ''}")
         for row_idx in error_indices:
             row = df.iloc[row_idx].to_dict()
-            result = await process_sample_async(
+            result, usage = await process_sample_async(
                 row, row_idx, client, semaphore, args.model, template, gen_config, loop
             )
+            merge_usage(usage_stats, usage)
             results[row_idx] = result
             if result.get("response"):
                 clear_error(errors, row_idx)
@@ -438,6 +534,18 @@ async def async_main(args):
                 print(f"  idx={row_idx} → ERR (still failing)")
         await save_results(results, output_path, lock)
         save_error_log(errors, error_path)
+        append_summary(summary_path, {
+            "start": run_start.isoformat(),
+            "end": datetime.now().isoformat(),
+            "model": args.model,
+            "range": [start, end],
+            "processed": len(results),
+            "ok": sum(1 for i in error_indices if i not in errors),
+            "errors": len(errors),
+            "mode": "retry-errors",
+            "token_usage": usage_stats,
+            "cost_estimate": estimate_cost_usd(args.model, usage_stats),
+        })
         print(f"Done. Remaining errors: {len(errors)}")
         return
 
@@ -454,10 +562,11 @@ async def async_main(args):
     async def process_one(row_idx: int):
         nonlocal completed
         row    = df.iloc[row_idx].to_dict()
-        result = await process_sample_async(
+        result, usage = await process_sample_async(
             row, row_idx, client, semaphore, args.model, template, gen_config, loop
         )
         async with lock:
+            merge_usage(usage_stats, usage)
             results[row_idx] = result
             completed += 1
             if result.get("response"):
@@ -490,10 +599,13 @@ async def async_main(args):
     append_summary(summary_path, {
         "start":     run_start.isoformat(),
         "end":       datetime.now().isoformat(),
+        "model":     args.model,
         "range":     [start, end],
         "processed": len(results),
         "ok":        n_ok,
         "errors":    n_err,
+        "token_usage": usage_stats,
+        "cost_estimate": estimate_cost_usd(args.model, usage_stats),
     })
 
     print(f"\nDone. {n_ok} OK, {n_err} failed → {output_path}")
@@ -501,6 +613,16 @@ async def async_main(args):
         failed_list = sorted(int(k) for k in errors.keys())
         print(f"  Failed indices: {failed_list[:20]}{'...' if len(failed_list) > 20 else ''}")
         print(f"  Re-run with --retry-errors to retry them.")
+
+    # Cost summary
+    prompt_tok = usage_stats.get("prompt_tokens", 0)
+    compl_tok  = usage_stats.get("completion_tokens", 0)
+    total_tok  = prompt_tok + compl_tok
+    cost = (prompt_tok / 1_000_000) * args.price_input + \
+           (compl_tok  / 1_000_000) * args.price_output
+    print(f"\n  Tokens — prompt: {prompt_tok:,}  completion: {compl_tok:,}  total: {total_tok:,}")
+    print(f"  Estimated cost: ${cost:.4f}  "
+          f"(input ${args.price_input}/1M, output ${args.price_output}/1M)")
 
 
 def main():
@@ -538,6 +660,11 @@ def main():
     parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--n",                  type=int,   default=1)
     parser.add_argument("--max-tokens",         type=int,   default=81920)
+    # Cost tracking
+    parser.add_argument("--price-input",  type=float, default=0.26,
+                        help="Input token price per 1M tokens in USD (default: 0.26)")
+    parser.add_argument("--price-output", type=float, default=0.38,
+                        help="Output token price per 1M tokens in USD (default: 0.38)")
     args = parser.parse_args()
 
     asyncio.run(async_main(args))

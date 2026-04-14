@@ -42,6 +42,19 @@ MAX_RETRIES  = 5
 RETRY_DELAYS = [10, 30, 60, 120, 180]
 PHASE_LABELS = [f"Phase {i}:" for i in range(1, 7)]
 
+MODEL_PRICING_USD_PER_MTOK = {
+    "qwen/qwen3.5-397b-a17b": {
+        "input": 0.39,
+        "output": 2.34,
+        "source": "https://openrouter.ai/qwen/qwen3.5-397b-a17b",
+    },
+    "deepseek/deepseek-v3.2": {
+        "input": 0.26,
+        "output": 0.38,
+        "source": "https://openrouter.ai/deepseek/deepseek-v3.2",
+    },
+}
+
 # ── Rule-based detection constants ───────────────────────────
 
 C1_HARD_PATTERNS = [
@@ -202,6 +215,85 @@ def rule_detect_c2(reasoning: str) -> bool:
 def rule_detect_c3(response: str) -> bool:
     return any(p in (response or "") for p in PHASE_LABELS)
 
+
+def empty_usage_stats() -> dict:
+    return {
+        "requests": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "by_stage": {},
+    }
+
+
+def extract_usage(resp) -> dict:
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    def _read(obj, key: str) -> int:
+        if obj is None:
+            return 0
+        if isinstance(obj, dict):
+            return int(obj.get(key, 0) or 0)
+        return int(getattr(obj, key, 0) or 0)
+
+    prompt_tokens = _read(usage, "prompt_tokens")
+    completion_tokens = _read(usage, "completion_tokens")
+    total_tokens = _read(usage, "total_tokens") or (prompt_tokens + completion_tokens)
+    return {
+        "requests": 1,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def merge_usage(stats: dict, delta: dict | None, stage: str | None = None) -> dict:
+    if not delta:
+        return stats
+    for key in ("requests", "prompt_tokens", "completion_tokens", "total_tokens"):
+        stats[key] = int(stats.get(key, 0) or 0) + int(delta.get(key, 0) or 0)
+    if stage:
+        by_stage = stats.setdefault("by_stage", {})
+        stage_stats = by_stage.setdefault(stage, {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        })
+        for key in ("requests", "prompt_tokens", "completion_tokens", "total_tokens"):
+            stage_stats[key] = int(stage_stats.get(key, 0) or 0) + int(delta.get(key, 0) or 0)
+    return stats
+
+
+def estimate_cost_usd(model: str, usage_stats: dict) -> dict:
+    pricing = MODEL_PRICING_USD_PER_MTOK.get(model)
+    if not pricing:
+        return {
+            "model": model,
+            "pricing_found": False,
+            "input_cost_usd": None,
+            "output_cost_usd": None,
+            "total_cost_usd": None,
+            "pricing_source": None,
+        }
+
+    input_cost = usage_stats.get("prompt_tokens", 0) / 1_000_000 * pricing["input"]
+    output_cost = usage_stats.get("completion_tokens", 0) / 1_000_000 * pricing["output"]
+    return {
+        "model": model,
+        "pricing_found": True,
+        "input_cost_usd": round(input_cost, 6),
+        "output_cost_usd": round(output_cost, 6),
+        "total_cost_usd": round(input_cost + output_cost, 6),
+        "pricing_source": pricing["source"],
+        "pricing_usd_per_mtok": {
+            "input": pricing["input"],
+            "output": pricing["output"],
+        },
+    }
+
 # ── Message builders ──────────────────────────────────────────
 
 def build_detect_message(question: str, options, reasoning: str, response: str) -> str:
@@ -263,7 +355,7 @@ async def call_api_async(
     user: str,
     max_tokens: int,
     label: str,
-) -> str | None:
+) -> tuple[str | None, dict]:
     async with semaphore:
         for attempt in range(MAX_RETRIES):
             try:
@@ -276,7 +368,7 @@ async def call_api_async(
                     max_tokens=max_tokens,
                     extra_body={"include_reasoning": False},
                 )
-                return resp.choices[0].message.content or ""
+                return resp.choices[0].message.content or "", extract_usage(resp)
             except Exception as e:
                 err = str(e)
                 is_rate = "429" in err or "rate" in err.lower()
@@ -286,15 +378,15 @@ async def call_api_async(
                     await asyncio.sleep(wait)
                 else:
                     print(f"\n  [API ERROR] {label}: {e}")
-                    return None
-    return None
+                    return None, empty_usage_stats()
+    return None, empty_usage_stats()
 
 # ── Detection ─────────────────────────────────────────────────
 
 async def detect_issues_async(
     client, semaphore, model, detect_prompt,
     question, options, reasoning, response, label
-) -> dict | None:
+) -> tuple[dict | None, dict]:
     # Rule-based detection (always runs, cannot be missed by LLM)
     c1_rule = rule_detect_c1(reasoning)
     c2_rule = rule_detect_c2(reasoning)
@@ -302,9 +394,9 @@ async def detect_issues_async(
     c4_rule = rule_detect_c1(response)
 
     user_msg = build_detect_message(question, options, reasoning, response)
-    raw = await call_api_async(client, semaphore, model, detect_prompt, user_msg, 512, label + "/detect")
+    raw, usage = await call_api_async(client, semaphore, model, detect_prompt, user_msg, 512, label + "/detect")
     if raw is None:
-        return None
+        return None, usage
     try:
         llm = parse_json_safe(raw)
         result = {
@@ -321,7 +413,7 @@ async def detect_issues_async(
         ]:
             if rule_val and not llm_val:
                 print(f"\n  [RULE] {label}: rule caught {key.upper()} that LLM missed")
-        return result
+        return result, usage
     except Exception as e:
         print(f"\n  [WARN] Detection parse failed {label}: {e} | raw: {raw[:150]}")
         return {
@@ -329,22 +421,22 @@ async def detect_issues_async(
             "c2": c2_rule or True,
             "c3": c3_rule,
             "c4": c4_rule or True,
-        }
+        }, usage
 
 # ── Rewrite ───────────────────────────────────────────────────
 
 async def rewrite_sample_async(
     client, semaphore, model, rewrite_prompt,
     question, options, reasoning, response, answer, issues, label, max_tokens
-) -> dict | None:
+) -> tuple[dict | None, dict]:
     user_msg = build_rewrite_message(question, options, reasoning, response, answer, issues)
-    raw = await call_api_async(client, semaphore, model, rewrite_prompt, user_msg, max_tokens, label + "/rewrite")
+    raw, usage = await call_api_async(client, semaphore, model, rewrite_prompt, user_msg, max_tokens, label + "/rewrite")
     if raw is None:
-        return None
+        return None, usage
     result = parse_rewrite_output(raw)
     if result is None:
         print(f"\n  [WARN] Rewrite delimiter not found for {label} | raw: {raw[:200]}")
-        return None
+        return None, usage
     wf = result.get("workflow")
     if wf:
         print(f"\n  [WF] {label} → {wf}")
@@ -352,7 +444,7 @@ async def rewrite_sample_async(
         "reasoning": result["reasoning"] if result["reasoning"] else reasoning,
         "response":  result["response"]  if result["response"]  else response,
         "workflow":  wf,
-    }
+    }, usage
 
 # ── Per-sample processing ─────────────────────────────────────
 
@@ -361,7 +453,8 @@ async def process_sample_async(
     client, semaphore, model,
     detect_prompt, rewrite_prompt, clean_rewrite_prompt,
     max_tokens, max_iterations: int = 3,
-) -> dict | None:
+) -> tuple[dict | None, dict]:
+    usage_stats = empty_usage_stats()
     idx      = sample.get("_index", 0)
     subset   = sample.get("_subset", "unknown")
     label    = f"{subset}_{idx}"
@@ -373,15 +466,16 @@ async def process_sample_async(
     response  = sample.get("response")  or ""
 
     if not reasoning and not response:
-        return None
+        return None, usage_stats
 
     # ── Step 1: Detection ────────────────────────────────────
-    issues = await detect_issues_async(
+    issues, usage = await detect_issues_async(
         client, semaphore, model, detect_prompt,
         question, options, reasoning, response, label
     )
+    merge_usage(usage_stats, usage, "detect")
     if issues is None:
-        return None
+        return None, usage_stats
 
     # ── Path A: Clean — light 6-phase rewrite ────────────────
     if not any(issues.values()):
@@ -405,17 +499,18 @@ async def process_sample_async(
             f"If structure repair is needed, apply the lightest possible restructuring while retaining every substantive step in full. "
             f"Return the complete output."
         )
-        raw = await call_api_async(
+        raw, usage = await call_api_async(
             client, semaphore, model,
             clean_rewrite_prompt, user_msg, max_tokens, label + "/clean"
         )
+        merge_usage(usage_stats, usage, "clean")
         if raw is None:
-            return None
+            return None, usage_stats
 
         result = parse_rewrite_output(raw)
         if result is None:
             print(f"\n  [WARN] Clean rewrite delimiter not found for {label} | raw: {raw[:200]}")
-            return None
+            return None, usage_stats
 
         new_reasoning = result["reasoning"] or reasoning
         new_response  = result["response"]  or response
@@ -433,7 +528,7 @@ async def process_sample_async(
             "pf_iterations":      1,
             "_pf_flags":          "",
             "pf_workflow":        "clean-preserve",
-        }
+        }, usage_stats
 
     # ── Path B: Flagged — diverse workflow rewrite ───────────
     cur_reasoning   = reasoning
@@ -443,14 +538,15 @@ async def process_sample_async(
     chosen_workflow = None
 
     for iteration in range(max_iterations):
-        rewritten = await rewrite_sample_async(
+        rewritten, usage = await rewrite_sample_async(
             client, semaphore, model, rewrite_prompt,
             question, options, cur_reasoning, cur_response,
             answer, final_issues, f"{label}/iter{iteration+1}", max_tokens
         )
+        merge_usage(usage_stats, usage, "rewrite")
 
         if rewritten is None:
-            return None
+            return None, usage_stats
 
         cur_reasoning   = rewritten["reasoning"] or cur_reasoning
         cur_response    = rewritten["response"]  or cur_response
@@ -458,11 +554,12 @@ async def process_sample_async(
             chosen_workflow = rewritten["workflow"]
         iterations_done = iteration + 1
 
-        re_issues = await detect_issues_async(
+        re_issues, usage = await detect_issues_async(
             client, semaphore, model, detect_prompt,
             question, options, cur_reasoning, cur_response,
             f"{label}/recheck{iteration+1}"
         )
+        merge_usage(usage_stats, usage, "recheck")
 
         if re_issues is None:
             break
@@ -487,7 +584,7 @@ async def process_sample_async(
         "pf_iterations":      iterations_done,
         "_pf_flags":          flags,
         "pf_workflow":        chosen_workflow,
-    }
+    }, usage_stats
 
 # ── Save ──────────────────────────────────────────────────────
 
@@ -617,6 +714,7 @@ async def async_main(args):
         print(f"[RESUME] Error log: {len(errors)} previously failed index(es)")
 
     run_start = datetime.now()
+    usage_stats = empty_usage_stats()
 
     detect_prompt        = load_prompt(args.detect_prompt)
     rewrite_prompt       = load_rewrite_prompt(args.rewrite_prompt, args.workflows)
@@ -632,22 +730,51 @@ async def async_main(args):
             print(f"[ERROR] _index {args.retry_index} not found.")
             return
         print(f"[RETRY] _index={args.retry_index}")
-        result = await process_sample_async(
+        result, usage = await process_sample_async(
             target, client, semaphore, args.model,
             detect_prompt, rewrite_prompt, clean_rewrite_prompt,
             args.max_tokens, max_iterations=args.max_iterations,
         )
+        merge_usage(usage_stats, usage)
         if result:
             results[args.retry_index] = result
             clear_error(errors, args.retry_index)
             await save_results(results, output_path, lock)
             save_error_log(errors, error_path)
+            append_summary(summary_path, {
+                "start": run_start.isoformat(),
+                "end": datetime.now().isoformat(),
+                "model": args.model,
+                "range": [args.retry_index, args.retry_index + 1],
+                "processed": len(results),
+                "clean": 1 if not result.get("_pf_flags") else 0,
+                "rewritten": 1 if result.get("_pf_flags") else 0,
+                "errors": len(errors),
+                "failed": 0,
+                "mode": "retry-index",
+                "token_usage": usage_stats,
+                "cost_estimate": estimate_cost_usd(args.model, usage_stats),
+            })
             flags = result.get("_pf_flags", "")
             status = f"issues [{flags}]" if flags else "clean"
             print(f"  → {status}  Saved → {output_path}")
         else:
             log_error(errors, args.retry_index, "api_or_parse_failure")
             save_error_log(errors, error_path)
+            append_summary(summary_path, {
+                "start": run_start.isoformat(),
+                "end": datetime.now().isoformat(),
+                "model": args.model,
+                "range": [args.retry_index, args.retry_index + 1],
+                "processed": len(results),
+                "clean": 0,
+                "rewritten": 0,
+                "errors": len(errors),
+                "failed": 1,
+                "mode": "retry-index",
+                "token_usage": usage_stats,
+                "cost_estimate": estimate_cost_usd(args.model, usage_stats),
+            })
             print("  → FAILED (logged to error log)")
         return
 
@@ -666,11 +793,12 @@ async def async_main(args):
             if target is None:
                 print(f"  idx={idx} → NOT FOUND in input (skipping)")
                 continue
-            result = await process_sample_async(
+            result, usage = await process_sample_async(
                 target, client, semaphore, args.model,
                 detect_prompt, rewrite_prompt, clean_rewrite_prompt,
                 args.max_tokens, max_iterations=args.max_iterations,
             )
+            merge_usage(usage_stats, usage)
             if result:
                 results[idx] = result
                 clear_error(errors, idx)
@@ -682,6 +810,20 @@ async def async_main(args):
                 print(f"  idx={idx} → ERR (still failing)")
         await save_results(results, output_path, lock)
         save_error_log(errors, error_path)
+        append_summary(summary_path, {
+            "start": run_start.isoformat(),
+            "end": datetime.now().isoformat(),
+            "model": args.model,
+            "range": [start, end],
+            "processed": len(results),
+            "clean": 0,
+            "rewritten": len(error_indices) - len(errors),
+            "errors": len(errors),
+            "failed": len(errors),
+            "mode": "retry-errors",
+            "token_usage": usage_stats,
+            "cost_estimate": estimate_cost_usd(args.model, usage_stats),
+        })
         print(f"Done. Remaining errors: {len(errors)}")
         return
 
@@ -701,12 +843,13 @@ async def async_main(args):
     async def process_one(sample: dict):
         nonlocal completed
         idx    = sample.get("_index", 0)
-        result = await process_sample_async(
+        result, usage = await process_sample_async(
             sample, client, semaphore, args.model,
             detect_prompt, rewrite_prompt, clean_rewrite_prompt,
             args.max_tokens, max_iterations=args.max_iterations,
         )
         async with lock:
+            merge_usage(usage_stats, usage)
             completed += 1
             if result is None:
                 stats["failed"] += 1
@@ -741,11 +884,15 @@ async def async_main(args):
     append_summary(summary_path, {
         "start":     run_start.isoformat(),
         "end":       datetime.now().isoformat(),
+        "model":     args.model,
         "range":     [start, end],
         "processed": len(results),
         "clean":     stats["clean"],
         "rewritten": stats["rewritten"],
         "errors":    len(errors),
+        "failed":    stats["failed"],
+        "token_usage": usage_stats,
+        "cost_estimate": estimate_cost_usd(args.model, usage_stats),
     })
 
     print(f"\nDone. clean={stats['clean']} rewritten={stats['rewritten']} failed={stats['failed']}")
@@ -754,6 +901,16 @@ async def async_main(args):
         failed_list = sorted(int(k) for k in errors.keys())
         print(f"  Failed indices: {failed_list[:20]}{'...' if len(failed_list) > 20 else ''}")
         print(f"  Re-run with --retry-errors to retry them.")
+
+    # Cost summary
+    prompt_tok = usage_stats.get("prompt_tokens", 0)
+    compl_tok  = usage_stats.get("completion_tokens", 0)
+    total_tok  = prompt_tok + compl_tok
+    cost = (prompt_tok / 1_000_000) * args.price_input + \
+           (compl_tok  / 1_000_000) * args.price_output
+    print(f"\n  Tokens — prompt: {prompt_tok:,}  completion: {compl_tok:,}  total: {total_tok:,}")
+    print(f"  Estimated cost: ${cost:.4f}  "
+          f"(input ${args.price_input}/1M, output ${args.price_output}/1M)")
 
 
 def main():
@@ -790,6 +947,11 @@ def main():
                         help="Max tokens for rewrite step (default: 131072)")
     parser.add_argument("--max-iterations", type=int, default=3,
                         help="Max detect→rewrite iterations per sample (default: 3)")
+    # Cost tracking
+    parser.add_argument("--price-input",  type=float, default=0.26,
+                        help="Input token price per 1M tokens in USD (default: 0.26)")
+    parser.add_argument("--price-output", type=float, default=0.38,
+                        help="Output token price per 1M tokens in USD (default: 0.38)")
     args = parser.parse_args()
 
     asyncio.run(async_main(args))

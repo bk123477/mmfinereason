@@ -5,6 +5,7 @@ MMFineReason 데이터셋의 reasoning 생성 및 post-filtering 파이프라인
 ```
 sft_reason.py       → 각 parquet 샘플에 대해 reasoning + response 생성
 sft_postfilter.py   → 생성된 reasoning의 품질 검사 및 재작성
+sft_2step_pipeline.py → VLM 생성 후 LLM 재구성/정제까지 한 번에 수행
 ```
 
 ---
@@ -25,6 +26,16 @@ dataset/reasoning/NNNNN/train_NNNNN_partP.json
         │
         ▼
 dataset/post_filtering/NNNNN/train_NNNNN_partP.json
+
+dataset/raw/train-NNNNN-of-00070.parquet
+        │
+        ▼
+ sft_2step_pipeline.py
+   Step 1: qwen/qwen3.5-397b-a17b (VLM generation)
+   Step 2: deepseek/deepseek-v3.2 (LLM reconstruct / decontaminate)
+        │
+        ▼
+dataset/two_step_pipeline/NNNNN/train_NNNNN_partP.json
 ```
 
 ---
@@ -44,6 +55,12 @@ dataset/
 │           ├── train_00000_part0_summary.json   ← 실행 이력 (append)
 │           └── ...
 └── post_filtering/
+    └── 00000/
+        ├── train_00000_part0.json
+        └── logs/
+            ├── train_00000_part0_errors.json
+            └── train_00000_part0_summary.json
+└── two_step_pipeline/
     └── 00000/
         ├── train_00000_part0.json
         └── logs/
@@ -219,6 +236,113 @@ python sft_postfilter.py --model MODEL --input ... --part 0 --retry-index 1234
 
 ---
 
+## sft_2step_pipeline.py
+
+123K 실험용 2-step 파이프라인입니다.
+
+- **Step 1 (VLM)**: 이미지 + 질문 + 원본 think/answer를 보고 새 `reasoning_vlm`, `response_vlm` 생성
+- **Step 2 (LLM)**: 생성 결과를 다시 읽고
+  - reference/source 언급 제거
+  - reasoning을 workflow 기반으로 자연스럽게 재구성
+  - response를 설명형 prose로 다듬기
+
+최종 결과는 “하나의 VLM이 직접 보고 reasoning/response를 생성한 것처럼” 읽히도록 설계되어 있습니다.
+
+### 기본 사용법
+
+```bash
+python sft_2step_pipeline.py \
+  --parquet dataset/raw/MMFineReason-SFT-123K/data/train-00000-of-00070.parquet \
+  --part 0
+```
+
+### 권장 실행 예시
+
+```bash
+python sft_2step_pipeline.py \
+  --vlm-model qwen/qwen3.5-397b-a17b \
+  --llm-model deepseek/deepseek-v3.2 \
+  --parquet dataset/raw/MMFineReason-SFT-123K/data/train-00000-of-00070.parquet \
+  --output-dir dataset/two_step_pipeline_123k \
+  --workers 8 \
+  --part 0
+```
+
+### 4개 터미널 병렬 처리
+
+```bash
+# Terminal 0
+python sft_2step_pipeline.py --parquet train-00000-of-00070.parquet --part 0
+
+# Terminal 1
+python sft_2step_pipeline.py --parquet train-00000-of-00070.parquet --part 1
+
+# Terminal 2
+python sft_2step_pipeline.py --parquet train-00000-of-00070.parquet --part 2
+
+# Terminal 3
+python sft_2step_pipeline.py --parquet train-00000-of-00070.parquet --part 3
+```
+
+### Resume
+
+동일 명령어를 다시 실행하면 됩니다.
+
+```bash
+python sft_2step_pipeline.py --parquet ... --part 0
+```
+
+### 실패 index 재시도
+
+```bash
+# error log 전체 재시도
+python sft_2step_pipeline.py --parquet ... --part 0 --retry-errors
+
+# 단일 index 재시도
+python sft_2step_pipeline.py --parquet ... --part 0 --retry-index 1234
+```
+
+### 주요 인자
+
+| 인자 | 기본값 | 설명 |
+|------|--------|------|
+| `--parquet` | (필수) | 입력 parquet 파일 |
+| `--api-key` | `$OPENROUTER_API_KEY` | OpenRouter API key |
+| `--vlm-model` | `qwen/qwen3.5-397b-a17b` | 1단계 VLM 모델 |
+| `--llm-model` | `deepseek/deepseek-v3.2` | 2단계 LLM 모델 |
+| `--template-path` | `prompts/reasoning_distillation.md` | 1단계 생성 프롬프트 |
+| `--reconstruct-prompt` | `prompts/reconstruct_prompt.md` | 2단계 재구성 프롬프트 |
+| `--workflows` | `prompts/reasoning_workflows.md` | reconstruct prompt에 append되는 workflow 정의 |
+| `--output-dir` | `dataset/two_step_pipeline` | 출력 루트 디렉토리 |
+| `--workers` | `8` | 동시 API 요청 수 |
+| `--part` | None | 파트 번호 (0-based) |
+| `--num-parts` | `4` | 전체 파트 수 |
+| `--start-index` | `0` | 수동 범위 지정 (--part 미사용 시) |
+| `--end-index` | None | 수동 범위 지정 (--part 미사용 시) |
+| `--retry-index` | None | 단일 index 재실행 |
+| `--retry-errors` | False | error log의 모든 index 재시도 |
+| `--save-every` | `20` | N개 완료마다 저장 |
+| `--llm-max-iterations` | `2` | 2단계 재작성 최대 반복 수 |
+| `--vlm-max-tokens` | `131072` | 1단계 최대 생성 토큰 수 |
+| `--llm-max-tokens` | `32768` | 2단계 최대 생성 토큰 수 |
+
+### 비용 집계
+
+summary에는 두 단계 비용이 모두 누적됩니다.
+
+- `token_usage.vlm`
+- `token_usage.llm`
+- `cost_estimate.vlm`
+- `cost_estimate.llm`
+- `cost_estimate.total_cost_usd`
+
+123K용 새 데이터셋을 받을 예정이면 보통 아래 둘만 먼저 바꾸면 됩니다.
+
+- 입력: `dataset/raw/MMFineReason-SFT-123K/data`
+- 출력: `dataset/two_step_pipeline_123k`
+
+아래 `scripts/run_2step_part.sh`, `scripts/retry_2step_errors_part.sh`도 같은 위치를 기준으로 만들어 두었습니다.
+
 ## 로그 파일
 
 ### `_errors.json`
@@ -240,6 +364,7 @@ python sft_postfilter.py --model MODEL --input ... --part 0 --retry-index 1234
 ### `_summary.json`
 
 실행할 때마다 결과를 append합니다. Resume해도 기존 기록이 유지됩니다.
+각 run에는 OpenRouter 토큰 사용량과 비용 추정치도 함께 저장됩니다.
 
 ```json
 {
@@ -247,14 +372,32 @@ python sft_postfilter.py --model MODEL --input ... --part 0 --retry-index 1234
     {
       "start": "2026-04-08T09:00:00",
       "end":   "2026-04-08T11:30:00",
+      "model": "qwen/qwen3.5-397b-a17b",
       "range": [0, 2100],
       "processed": 2100,
       "ok": 2098,
-      "errors": 2
+      "errors": 2,
+      "token_usage": {
+        "requests": 2100,
+        "prompt_tokens": 123456789,
+        "completion_tokens": 45678901,
+        "total_tokens": 169135690
+      },
+      "cost_estimate": {
+        "model": "qwen/qwen3.5-397b-a17b",
+        "pricing_found": true,
+        "input_cost_usd": 14.814815,
+        "output_cost_usd": 13.70367,
+        "total_cost_usd": 28.518485
+      }
     }
   ]
 }
 ```
+
+- `sft_reason.py` 비용 추정은 `qwen/qwen3.5-397b-a17b` 가격표를 기준으로 계산합니다.
+- `sft_postfilter.py` 비용 추정은 `deepseek/deepseek-v3.2` 가격표를 기준으로 계산합니다.
+- `token_usage`는 OpenRouter 응답의 `usage` 필드를 합산한 값입니다.
 
 ---
 

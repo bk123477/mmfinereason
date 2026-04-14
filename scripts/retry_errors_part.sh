@@ -1,18 +1,19 @@
 #!/bin/bash
 # ==============================================================
-#  run_part.sh — Run one part sequentially across all parquets
+#  retry_errors_part.sh — Retry failed samples sequentially
+#                         across all parquets for one part
 #
 #  Usage:
-#    bash scripts/run_part.sh <part>
+#    bash scripts/retry_errors_part.sh <part>
 #
 #  Example (open 4 terminals, one per part):
-#    bash scripts/run_part.sh 0
-#    bash scripts/run_part.sh 1
-#    bash scripts/run_part.sh 2
-#    bash scripts/run_part.sh 3
+#    bash scripts/retry_errors_part.sh 0
+#    bash scripts/retry_errors_part.sh 1
+#    bash scripts/retry_errors_part.sh 2
+#    bash scripts/retry_errors_part.sh 3
 #
-#  Each terminal handles one part and advances to the next parquet
-#  automatically when the current one finishes.
+#  For each parquet, checks if an error log exists and has entries.
+#  Skips parquets with no error log or empty error log.
 # ==============================================================
 
 # ── Configuration — MODIFY THESE BEFORE RUNNING ──────────────
@@ -23,12 +24,11 @@ PYTHON_SCRIPT="/Users/hongminki/Downloads/SKT/mmfinereason/src/sft_reconstruct/s
 OUTPUT_DIR="/Users/hongminki/Downloads/SKT/mmfinereason/dataset/reconstructed"
 
 MODEL="deepseek/deepseek-v3.2"
-WORKERS=100
+WORKERS=150
 NUM_PARTS=4
 
-# Parquet range (inclusive on both ends, zero-padded 5-digit indices)
-START_IDX=2     # start from 00002 (0-based)
-END_IDX=69      # last parquet index (00069)
+START_IDX=0
+END_IDX=69
 
 # Set to "--save-image" to include image_b64 in output, or leave empty
 SAVE_IMAGE_FLAG=""
@@ -59,13 +59,16 @@ if [[ ${N_TOTAL} -eq 0 ]]; then
 fi
 
 echo "============================================================"
+echo "Mode      : retry-errors"
 echo "Part      : ${PART} / $(( NUM_PARTS - 1 ))"
 echo "Range     : ${START_IDX} → ${END_IDX}  (total parquets found: ${N_TOTAL})"
 echo "Model     : ${MODEL}"
 echo "Workers   : ${WORKERS}"
 echo "Output    : ${OUTPUT_DIR}"
-echo "Save image: ${SAVE_IMAGE_FLAG:-no}"
 echo "============================================================"
+
+SKIPPED=0
+RETRIED=0
 
 for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     if [[ ${idx} -ge ${N_TOTAL} ]]; then
@@ -76,10 +79,37 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     PARQUET="${PARQUETS[$idx]}"
     PARQUET_NAME="$(basename "${PARQUET}")"
 
+    # Derive the stem (e.g. train-00002-of-00070.parquet → train_00002)
+    STEM=$(echo "${PARQUET_NAME%.parquet}" | cut -d'-' -f1,2 | tr '-' '_')
+    PADDED=$(printf "%05d" "${idx}")
+    ERROR_LOG="${OUTPUT_DIR}/${PADDED}/logs/${STEM}_part${PART}_errors.json"
+
+    # Skip if error log doesn't exist
+    if [[ ! -f "${ERROR_LOG}" ]]; then
+        echo "[SKIP] ${PARQUET_NAME} part${PART} — no error log"
+        (( SKIPPED++ )) || true
+        continue
+    fi
+
+    # Skip if error log is empty ({})
+    ERROR_COUNT=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('${ERROR_LOG}'))
+    print(len(d))
+except:
+    print(0)
+")
+    if [[ "${ERROR_COUNT}" -eq 0 ]]; then
+        echo "[SKIP] ${PARQUET_NAME} part${PART} — 0 errors in log"
+        (( SKIPPED++ )) || true
+        continue
+    fi
+
     echo ""
     echo "------------------------------------------------------------"
-    printf "[%s] parquet %05d  part %d  →  %s\n" \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "${idx}" "${PART}" "${PARQUET_NAME}"
+    printf "[%s] parquet %05d  part %d  errors=%s  →  %s\n" \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${idx}" "${PART}" "${ERROR_COUNT}" "${PARQUET_NAME}"
     echo "------------------------------------------------------------"
 
     python "${PYTHON_SCRIPT}" \
@@ -91,12 +121,16 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
         --workers            "${WORKERS}" \
         --num-parts          "${NUM_PARTS}" \
         --part               "${PART}" \
+        --retry-errors \
         ${SAVE_IMAGE_FLAG}
 
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] parquet ${idx} part ${PART} done."
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] parquet ${idx} part ${PART} retry done."
+    (( RETRIED++ )) || true
 done
 
 echo ""
 echo "============================================================"
-echo "All done. Part ${PART} finished range [${START_IDX}, ${END_IDX}]."
+echo "Retry-errors part ${PART} finished."
+echo "  Retried : ${RETRIED} parquets"
+echo "  Skipped : ${SKIPPED} parquets (no errors)"
 echo "============================================================"
